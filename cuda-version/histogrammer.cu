@@ -516,3 +516,227 @@ void quantiles_bounds_cuda(
 	std::cout << "END quantiles_bounds_cuda" << std::endl;
 }
 
+
+
+
+//----------------------------
+//  Figure out the CDF
+// output:
+//   cdf        [F B+1]   (float32)
+// input:
+//   count      [F B]     (int64)
+//----------------------------
+void quantiles_cdf_cuda(
+	float* __restrict__ cdf_data,
+	const long long* __restrict__ count_data,
+	int F, int B)
+{
+	// Who am I ?
+	int bid = blockIdx.x;
+	int tid = threadIdx.x;
+	int n_thread = blockDim.x;
+	int rank = bid * n_thread + tid;
+
+	if (rank>=F)
+		return;
+	
+	// Find the right data pointers
+	float *cdf       = cdf_data[rank*(B+1)];
+	float *steps     = steps_data[rank*(B+1)];
+	long long *count = count_data[rank*B];
+	
+	// What is the grand total
+	long long grand_total = 0;
+	for (b=0; b<B; b++)
+		grad_total += count[b];
+	
+	// Fill in the cdf
+	cdf[0] = 0.0;
+	long long total = 0;
+	for (b=0; b<B; b++) {
+		total += count[b];
+		float y = (float)total / (float)grand_total;
+		cdf[b+1] = y;
+	}
+}
+
+
+//----------------------------
+//  Figure out the CDF
+// output:
+//   cdf        [F B+1]   (float32)
+// input:
+//   count      [F B]   (int64)
+//----------------------------
+void quantiles_cdf_cuda(
+	torch::Tensor cdf,
+	torch::Tensor count)
+{
+	printf("BEGIN quantiles_cdf_cuda\n");
+	
+	// Pointer to the data
+	float *cdf_data       = cdf.data_ptr<float>();
+	long long *count_data = count.data_ptr<int64_t>();
+	
+	// Get the shapes
+	int cF = cdf.sizes()[0];
+	int cB = cdf.sizes()[1]-1;
+	int hF = count.sizes()[0];
+	int hB = count.sizes()[1];
+	if (cF!=hF) {
+		printf("ERROR: quantiles_cdf_cuda nFeatures mismatch\n");
+		exit(1);
+	}
+	if (cB!=hB) {
+		printf("ERROR: quantiles_cdf_cuda n mBinsismatch\n");
+		exit(1);
+	}
+	
+	quantiles_cdf_kernel<<<(F+255)/256,256>>>(
+		cdf_data,
+		steps_data,
+		count_data,
+		cF, cB);
+
+	printf("END   quantiles_cdf_cuda\n");
+}
+
+
+//----------------------------
+//    Probality integral transform
+//  output:
+//    pit    [N F]     (float32)
+//    X      [N F]     (float32)
+//    cdf    [F B+1]   (float32)
+//    steps  [F B+1]   (float32)
+//----------------------------
+void quantiles_pit_kernel(
+	float* __restrict__ pit,
+	const float* __restrict__ X,
+	const float* __restrict__ cdf_data,
+	const float* __restrict__ steps_data,
+	int N, int F, int B)
+{
+	// Who am I ?
+	bidx = blockIdx.x;
+	bidy = blockIdx.y;
+	tidx = threadIdx.x;
+	tidy = threadIdx.y;
+	bdx  = blockDim.x;
+	bdy  = blockDim.y;
+	
+	// Where am I ?
+	n = bidx * bdx + tidx;
+	f = bidy * bdy + tidy;
+	
+	// Am I on the map?
+	if (n>=N or f>=F)
+		return;
+	
+	// Pointer into cdf and steps
+	float *cdf   = cdf_data[f*(B+1)];
+	float *steps = steps_data[f*(B+1)];
+	
+	// What's the x value
+	float x = X[n*F + f];
+	float y;
+	float x1 = steps[0];
+	float x2 = steps[B];
+	float y1 = cdf[0];
+	float y2 = cdf[B];
+	if (x<=x1)
+		y = y1;
+	else if (x>=x2)
+		y = y2;
+	else
+	{
+		// Binary Search
+		int lo = 0;
+		int hi = B;
+		while (hi-lo>1) {
+			int mid = (hi-lo)/2;
+			float xmid = steps[mid];
+			float ymid = cdf[mid];
+			if (x < xmid) {
+				hi = mid;
+				x2 = xmid;
+				y2 = ymid;
+			}
+			else {
+				lo = mid;
+				x1 = xmid;
+				y1 = ymid;
+			}
+		}
+		
+		// Linear interpolation
+		float delta = (x - x1) / (x2-x1 + 0.000001);
+		y = y1 + (y2-y1)*delta;
+	}
+	
+	// Write out the pit value
+	pit[n*F + f] = y;
+}
+
+
+//----------------------------
+//    Probality integral transform
+//  output:
+//    pit    [N F]     (float32)
+//    X      [N F]     (float32)
+//    cdf    [F B+1]   (float32)
+//    steps  [F B+1]   (float32)
+//----------------------------
+void quantiles_pit_cuda(
+	torch::Tensor pit,
+	torch::Tensor X,
+	torch::Tensor cdf,
+	torch::Tensor steps)
+{
+	printf("BEGIN quantiles_pit_cuda\n");
+	
+	// Pointer into the data
+	float *pit_data   = pit.data_ptr<float>();
+	float *X_data     = X.data_ptr<float>();
+	float *cdf_data   = cdf.data_ptr<float>();
+	float *steps_data = steps.data_ptr<float>();
+	
+	// Check the shapes
+	int pN = pit.sizes()[0];
+	int pF = pit.sizes()[1];
+	int xN = X.sizes()[0];
+	int xF = X.sizes()[1];
+	int cF = cdf.sizes()[0];
+	int cB = cdf.sizes()[1]-1;
+	int sF = steps.sizes()[0];
+	int sB = steps.sizes()[1]-1;
+	
+	// Check the shapes
+	if (pN!=xN) {
+		printf("ERROR quantiles_pit_cuda batch size mismatch\n");
+		exit(1);
+	}
+	if (pF!=xF || pF!=cF || pF!=sF) {
+		printf("ERROR quantiles_pit_cuda nFeatures mismatch\n");
+		exit(1);
+	}
+	if (cB!=sB) {
+		printf("ERROR quantiles_pit_cuda nBins mismatch\n");
+		exit(1);
+	}
+
+	// Launch the kernel
+	dim2 nBlk, tThr;
+	nThr.x = 128;
+	nThr.y = 2;
+	nBlk.x = (N+nThr.x-1) / nThr.x;
+	nBlk.y = (F+nThr.y-1) / nThr.y;
+	quantiles_pit_kernel<<<nBlk, nThr>>>(
+		pit,X,
+		cdf,steps,
+		N, F, B);
+
+	printf("END   quantiles_pit_cuda\n");
+}
+
+

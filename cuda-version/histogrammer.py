@@ -4,6 +4,8 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
+import numpy as np
+import matplotlib.pyplot as plt
 
 
 hgm__cuda_source = None
@@ -29,6 +31,10 @@ def Compile():
 		torch::Tensor histogram_cuda(torch::Tensor x, torch::Tensor steps);
 		torch::Tensor quantiles_cuda(torch::Tensor count, torch::Tensor steps);
 		void quantiles_bounds_cuda(torch::Tensor guess_steps, torch::Tensor quantiles_lo_x, torch::Tensor quantiles_lo_y, torch::Tensor quantiles_hi_x, torch::Tensor quantiles_hi_y, torch::Tensor count, torch::Tensor steps);
+		void cdf_cuda(torch::Tensor cdf, torch::Tensor count);
+		void pit_cuda(torch::Tensor pit, torch::Tensor X, torch::Tensor cdf, torch::Tensor steps);
+		void copula_legendre_cuda(torch::Tensor copula, torch::Tensor obs, torch::Tensor pred);
+		void plot_copula_legendre_cuda(torch::Tensor plot,torch::Tensor copula);
 	'''
 
 	def get_cuda_arch_flags():
@@ -55,7 +61,7 @@ def Compile():
 		name='inline_extension',
 		cpp_sources=[hgm__cpp_source],
 		cuda_sources=[hgm__cuda_source],
-		functions=['histogram_cuda', 'quantiles_cuda', 'quantiles_bounds_cuda'],
+		functions=['histogram_cuda', 'quantiles_cuda', 'quantiles_bounds_cuda', 'cdf_cuda', 'pit_cuda', 'copula_legendre_cuda', 'plot_copula_legendre_cuda'],
 		with_cuda=True,
 		extra_cuda_cflags=hgm__cuda_flags
 	)
@@ -78,23 +84,25 @@ class Histogrammer():
 			Compile()
 			
 		# Allocate the bounds and megabatch
-		self.megabatch = torch.zeros((nFilters,megabatch_size), dtype=torch.float32, device=device)
+		self.megabatch = torch.zeros((nFilters,megabatch_size), dtype=torch.float32, device=device, requires_grad=False)
 
 		# Allocate the global histogram
-		self.histogram = torch.zeros((nFilters,nBins), dtype=torch.int64, device=device)
+		self.histogram = torch.zeros((nFilters,nBins), dtype=torch.int64, device=device, requires_grad=False)
 		
 		# Allocate the steps and quantiles
-		self.steps     = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device)
-		self.quantiles_lo_x = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device)
-		self.quantiles_lo_y = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device)
-		self.quantiles_hi_x = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device)
-		self.quantiles_hi_y = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device)
-		self.quantiles      = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device)
-
+		self.steps     = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device, requires_grad=False)
+		self.quantiles_lo_x = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device, requires_grad=False)
+		self.quantiles_lo_y = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device, requires_grad=False)
+		self.quantiles_hi_x = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device, requires_grad=False)
+		self.quantiles_hi_y = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device, requires_grad=False)
+		self.quantiles      = torch.zeros((nFilters,nBins+1), dtype=torch.float32, device=device, requires_grad=False)
 
 		# Allocate the min and max bounds
 		self.minval = None  #torch.zeros((nFilters,), dtype=torch.float32, device=device)
 		self.maxval = None  #torch.zeros((nFilters,), dtype=torch.float32, device=device)
+		
+		# No cdf just yet
+		self.cdf = None
 
 	@torch.no_grad()
 	def begin_epoch(self):
@@ -230,6 +238,95 @@ class Histogrammer():
 
 			#print('End run quantiles')
 			
+	@torch.no_grad()
+	def calc_cdf(self):
+
+		print('Beg cdf', flush=True)
+
+		self.cdf = torch.zeros((self.nFilters, (self.nBins+1)), dtype=torch.float32, requires_grad=False, device=self.device)
+
+		torch.cuda.synchronize()
+		hgm__module.cdf_cuda(self.cdf, self.histogram);
+		torch.cuda.synchronize()
+
+		print('End cdf', flush=True)
+
+
+	@torch.no_grad()
+	def pit(self, X, stretch=True):
+
+		if (len(X.shape)!=2):
+			print('ERROR, histogrammer.pit expect 2D shape [N F]')
+			sys.exit(1)
+
+		# Have we run the cdf first?
+		if self.cdf == None:
+			self.calc_cdf()
+
+		# Calculate dimensions
+		pit = torch.zeros(X.shape, dtype=torch.float32, requires_grad=False, device=self.device)
+
+		torch.cuda.synchronize()
+		hgm__module.pit_cuda(pit, X, self.cdf, self.steps);
+		torch.cuda.synchronize()
+
+		if stretch:
+			pit = 2.0*pit - 1.0
+
+		return pit
+
+	@torch.no_grad()
+	def copula_legendre(self, obs, pred, M=11, run_pit=True):
+		
+		if (len(obs.shape)!=2 or len(pred.shape)!=2):
+			print('ERROR, histogrammer.copula_legendre expect 2D shape [N F]')
+			sys.exit(1)
+	
+		if run_pit:
+			obs  = self.pit(obs)
+			pred = self.pit(pred)
+	
+		# Allocate copula
+		F = obs.shape[1]
+		copula = torch.zeros((M,M,F), dtype=torch.float32, requires_grad=False, device=self.device)
+		
+		# Run the legendre copula
+		torch.cuda.synchronize()
+		hgm__module.copula_legendre_cuda(copula, obs, pred)
+		torch.cuda.synchronize()
+
+		return copula
+
+	@torch.no_grad()
+	def plot_copula_legendre(self, rows,cols,copula):
+
+		# Allocate plot
+		F = copula.shape[2]
+		plot = torch.zeros((rows,cols,F), dtype=torch.float32, requires_grad=False, device=self.device)
+	
+		# Plot the copula
+		torch.cuda.synchronize()
+		hgm__module.plot_copula_legendre_cuda(plot, copula)
+		torch.cuda.synchronize()
+		
+		return plot
+
+	def plt_plot_copula(self, copula_plot_np, f):
+		fontsize = 12
+		plot_rows = copula_plot_np.shape[0]
+		plot_cols = copula_plot_np.shape[1]
+		bin_a_mesh, bin_b_mesh = np.meshgrid(np.arange(plot_cols), np.arange(plot_rows))
+		plt.pcolormesh(bin_b_mesh, bin_a_mesh, copula_plot_np[:,:,f], shading='auto', cmap='viridis', vmin = 0 , vmax = 1.0)
+		nbins = plot_rows-1
+		bin_pos   = [0.0*nbins, 0.25*nbins, 0.5*nbins, 0.75*nbins, 1.0*nbins]
+		bin_label = [-1.0, -0.5, 0.0, 0.5, 1.0] 
+		plt.xticks(bin_pos, bin_label, fontsize = fontsize)
+		plt.yticks(bin_pos, bin_label, fontsize = fontsize)
+		cbar = plt.colorbar(label='Count')
+		cbar.set_label('Count', fontsize = fontsize)
+		cbar.ax.tick_params(labelsize=fontsize)		
+
+
 
 print('---------------------------------------------')
 print('---------------------------------------------')
@@ -239,16 +336,17 @@ print('---------------------------------------------')
 
 def test():
 
+
 	device='cuda'
-	nFilters = 1
+	nFilters = 10
 	nBins = 10
-	batch_size = 100
-	n_batch = 1000
+	batch_size = 1000
+	n_batch = 100
 	megabatch_size = 32768  #1024
 
 	hg = Histogrammer(device, nFilters, nBins, megabatch_size)
 
-	hg_epochs = 15
+	hg_epochs = 2
 
 	print('-----')
 	print(' Generate a dataset N(0,1)')
@@ -258,7 +356,7 @@ def test():
 		for b in range(n_batch):
 			batches.append(  torch.randn((batch_size,nFilters), dtype=torch.float32, device=device)  )
 			#batches[b] = F.relu(batches[b])
-			batches[b].fill_(0.0);
+			#batches[b].fill_(0.0);
 
 
 	print('---------')
@@ -289,5 +387,45 @@ def test():
 			input('quantiles   enter')
 
 	print('Done!')
-	
+
+	print('---------')
+	print(' Run Copula')
+	print('---------')
+	with torch.no_grad():
+
+		print('Calculate copula')
+		nMoments = 11
+		copula = torch.zeros((nMoments, nMoments, nFilters), dtype=torch.float32, device=device, requires_grad=False)
+		copula_count = 0
+
+		for b in range(n_batch//2):
+			print('  >batch', b, flush=True)
+			obs  = batches[2*b]
+			pred = batches[2*b+1]
+			#pred = 0.7*batches[2*b] + 0.3*batches[2*b+1]
+						
+			copula_batch = hg.copula_legendre(obs, pred, nMoments)
+			copula += copula_batch
+			copula_count += batch_size
+		
+		print('  divide by count')
+		copula /= copula_count    # rescale by num points
+		
+		print('Plot copula')
+		plot_rows = 512
+		plot_cols = 512
+		copula_plot = hg.plot_copula_legendre(plot_rows,plot_cols,copula)
+		
+		copula_plot_np = copula_plot.detach().cpu().numpy()
+		
+		print('Show Plots')
+		for f in range(nFilters):
+			plt.figure(figsize=(10, 6))
+			hg.plt_plot_copula(copula_plot_np, f)
+			plt.show()
+		
+
+if __name__ == "__main__":
+	test()
+
 	

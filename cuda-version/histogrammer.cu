@@ -526,9 +526,10 @@ void quantiles_bounds_cuda(
 // input:
 //   count      [F B]     (int64)
 //----------------------------
-void quantiles_cdf_cuda(
+__global__
+void cdf_kernel(
 	float* __restrict__ cdf_data,
-	const long long* __restrict__ count_data,
+	const int64_t* __restrict__ count_data,
 	int F, int B)
 {
 	// Who am I ?
@@ -541,19 +542,18 @@ void quantiles_cdf_cuda(
 		return;
 	
 	// Find the right data pointers
-	float *cdf       = cdf_data[rank*(B+1)];
-	float *steps     = steps_data[rank*(B+1)];
-	long long *count = count_data[rank*B];
+	float* cdf             = cdf_data    +  rank*(B+1);
+	const int64_t* count = count_data  +  rank*B;
 	
 	// What is the grand total
-	long long grand_total = 0;
-	for (b=0; b<B; b++)
-		grad_total += count[b];
+	int64_t grand_total = 0;
+	for (int b=0; b<B; b++)
+		grand_total += count[b];
 	
 	// Fill in the cdf
 	cdf[0] = 0.0;
-	long long total = 0;
-	for (b=0; b<B; b++) {
+	int64_t total = 0;
+	for (int b=0; b<B; b++) {
 		total += count[b];
 		float y = (float)total / (float)grand_total;
 		cdf[b+1] = y;
@@ -562,21 +562,21 @@ void quantiles_cdf_cuda(
 
 
 //----------------------------
-//  Figure out the CDF
+//  Figure out the Cumulative Distribution Function (CDF)
 // output:
 //   cdf        [F B+1]   (float32)
 // input:
 //   count      [F B]   (int64)
 //----------------------------
-void quantiles_cdf_cuda(
+void cdf_cuda(
 	torch::Tensor cdf,
 	torch::Tensor count)
 {
-	printf("BEGIN quantiles_cdf_cuda\n");
+	//printf("BEGIN cdf_cuda\n");
 	
 	// Pointer to the data
 	float *cdf_data       = cdf.data_ptr<float>();
-	long long *count_data = count.data_ptr<int64_t>();
+	int64_t *count_data = (int64_t*)count.data_ptr<int64_t>();
 	
 	// Get the shapes
 	int cF = cdf.sizes()[0];
@@ -592,25 +592,26 @@ void quantiles_cdf_cuda(
 		exit(1);
 	}
 	
-	quantiles_cdf_kernel<<<(F+255)/256,256>>>(
+	cdf_kernel<<<(cF+255)/256,256>>>(
 		cdf_data,
-		steps_data,
 		count_data,
 		cF, cB);
 
-	printf("END   quantiles_cdf_cuda\n");
+	//printf("END   cdf_cuda\n");
 }
 
 
 //----------------------------
-//    Probality integral transform
+//    Probality Integral Transform   (PIT)
 //  output:
 //    pit    [N F]     (float32)
+//  input:
 //    X      [N F]     (float32)
 //    cdf    [F B+1]   (float32)
 //    steps  [F B+1]   (float32)
 //----------------------------
-void quantiles_pit_kernel(
+__global__
+void pit_kernel(
 	float* __restrict__ pit,
 	const float* __restrict__ X,
 	const float* __restrict__ cdf_data,
@@ -618,24 +619,24 @@ void quantiles_pit_kernel(
 	int N, int F, int B)
 {
 	// Who am I ?
-	bidx = blockIdx.x;
-	bidy = blockIdx.y;
-	tidx = threadIdx.x;
-	tidy = threadIdx.y;
-	bdx  = blockDim.x;
-	bdy  = blockDim.y;
+	int bidx = blockIdx.x;
+	int bidy = blockIdx.y;
+	int tidx = threadIdx.x;
+	int tidy = threadIdx.y;
+	int bdx  = blockDim.x;
+	int bdy  = blockDim.y;
 	
 	// Where am I ?
-	n = bidx * bdx + tidx;
-	f = bidy * bdy + tidy;
+	int n = bidx * bdx + tidx;
+	int f = bidy * bdy + tidy;
 	
 	// Am I on the map?
 	if (n>=N or f>=F)
 		return;
 	
 	// Pointer into cdf and steps
-	float *cdf   = cdf_data[f*(B+1)];
-	float *steps = steps_data[f*(B+1)];
+	const float *cdf   = cdf_data   +  f*(B+1);
+	const float *steps = steps_data +  f*(B+1);
 	
 	// What's the x value
 	float x = X[n*F + f];
@@ -654,7 +655,7 @@ void quantiles_pit_kernel(
 		int lo = 0;
 		int hi = B;
 		while (hi-lo>1) {
-			int mid = (hi-lo)/2;
+			int mid = (hi+lo)/2;
 			float xmid = steps[mid];
 			float ymid = cdf[mid];
 			if (x < xmid) {
@@ -673,7 +674,7 @@ void quantiles_pit_kernel(
 		float delta = (x - x1) / (x2-x1 + 0.000001);
 		y = y1 + (y2-y1)*delta;
 	}
-	
+
 	// Write out the pit value
 	pit[n*F + f] = y;
 }
@@ -683,17 +684,18 @@ void quantiles_pit_kernel(
 //    Probality integral transform
 //  output:
 //    pit    [N F]     (float32)
+//  input:
 //    X      [N F]     (float32)
 //    cdf    [F B+1]   (float32)
 //    steps  [F B+1]   (float32)
 //----------------------------
-void quantiles_pit_cuda(
+void pit_cuda(
 	torch::Tensor pit,
 	torch::Tensor X,
 	torch::Tensor cdf,
 	torch::Tensor steps)
 {
-	printf("BEGIN quantiles_pit_cuda\n");
+	//printf("BEGIN pit_cuda\n");   fflush(stdout);
 	
 	// Pointer into the data
 	float *pit_data   = pit.data_ptr<float>();
@@ -713,30 +715,353 @@ void quantiles_pit_cuda(
 	
 	// Check the shapes
 	if (pN!=xN) {
-		printf("ERROR quantiles_pit_cuda batch size mismatch\n");
+		printf("ERROR quantiles_pit_cuda batch size mismatch\n");   fflush(stdout);
 		exit(1);
 	}
 	if (pF!=xF || pF!=cF || pF!=sF) {
-		printf("ERROR quantiles_pit_cuda nFeatures mismatch\n");
+		printf("ERROR quantiles_pit_cuda nFeatures mismatch\n");   fflush(stdout);
 		exit(1);
 	}
 	if (cB!=sB) {
-		printf("ERROR quantiles_pit_cuda nBins mismatch\n");
+		printf("ERROR quantiles_pit_cuda nBins mismatch\n");   fflush(stdout);
 		exit(1);
 	}
 
 	// Launch the kernel
-	dim2 nBlk, tThr;
-	nThr.x = 128;
-	nThr.y = 2;
-	nBlk.x = (N+nThr.x-1) / nThr.x;
-	nBlk.y = (F+nThr.y-1) / nThr.y;
-	quantiles_pit_kernel<<<nBlk, nThr>>>(
-		pit,X,
-		cdf,steps,
-		N, F, B);
+	dim3 nBlk, nThr;
+	nThr.x = 256;
+	nThr.y = 1;
+	nThr.z = 1;
+	nBlk.x = (pN+nThr.x-1) / nThr.x;
+	nBlk.y = (pF+nThr.y-1) / nThr.y;
+	nBlk.z = 1;
+	//printf("pN %d pF %d xN %d xF %d cF %d cB %d sF %d sB %d\n", pN, pF, xN, xF, cF, cB, sF, sB);
+	//printf("nBlk %d %d %d   nThr %d %d %d\n", nBlk.x, nBlk.y, nBlk.z, nThr.x, nThr.y, nThr.z);
+	//fflush(stdout);
+	pit_kernel<<<nBlk, nThr>>>(
+		pit_data,X_data,
+		cdf_data,steps_data,
+		pN, pF, cB);
 
-	printf("END   quantiles_pit_cuda\n");
+	//printf("END   pit_cuda\n");   fflush(stdout);
 }
+
+#define MAX_LEGENDRE_MOMENTS 11
+
+
+//----------------------------
+// Legendre polynomial copula
+// output:
+//    copula  [M M F]     (float32)     obs-vs-pred Legendre copula
+// input:
+//    obs:       [N F]    (float32)     PIT of obs values
+//    pred:      [N F]    (float32)     PIT of pred values
+//----------------------------
+__global__
+void copula_legendre_kernel(
+	float* __restrict__ copula_data,
+	const float* __restrict__ obs_data,
+	const float* __restrict__ pred_data,
+	int M, int N, int F)
+{
+	// Local storage
+	__shared__ float local_copula[MAX_LEGENDRE_MOMENTS][MAX_LEGENDRE_MOMENTS];
+	__shared__ float local_mom_obs[256][MAX_LEGENDRE_MOMENTS];
+	__shared__ float local_mom_pred[256][MAX_LEGENDRE_MOMENTS];
+	
+	// Where am I ?
+	int bidx = blockIdx.x;
+	int tidx = threadIdx.x;
+	int bdim = blockDim.x;
+	int n0 = (tidx*N)/bdim;
+	int n1 = ((tidx+1)*N)/bdim;
+	int f  = bidx;
+
+	// Pointer into the local moments
+	float *mom_obs  = local_mom_obs[tidx];
+	float *mom_pred = local_mom_pred[tidx];
+	
+	// Clear out local storage
+	if (tidx<(MAX_LEGENDRE_MOMENTS*MAX_LEGENDRE_MOMENTS)) {          // Assumes bdim>MAX_LEGENDRE_MOMENTS^2 which should
+		int mo = tidx/MAX_LEGENDRE_MOMENTS;                      //  always be true   bdim=256   MAX_LEGENDRE_MOMENTS^2=121
+		int mp = tidx - (mo*MAX_LEGENDRE_MOMENTS);
+		local_copula[mo][mp] = 0.0;
+	}
+	for (int i=0; i<MAX_LEGENDRE_MOMENTS; i++)
+		mom_obs[i] = 0.0;
+	for (int i=0; i<MAX_LEGENDRE_MOMENTS; i++)
+		mom_pred[i] = 0.0;
+
+	__syncthreads();
+	
+	
+	// Loop over your data
+	for (int n=n0; n<n1; n++)
+	{	
+		// What are values
+		float oval = obs_data[n*F + f];     // Assumes already stretched to [-1 1]
+		float pval = pred_data[n*F + f];
+		
+		// Calculate 1D moments
+		mom_obs[0] = 1.0;
+		mom_obs[1] = oval;
+		mom_pred[0] = 1.0;
+		mom_pred[1] = pval;
+
+		// Bonnet's recurrence		
+		for (int m=2; m<M; m++) {
+			float over_m = 1.0 / m;
+			mom_obs[m]  = over_m * ((2.0*(m-1)+1.0)*oval*mom_obs[m-1]  - (m-1.0)*mom_obs[m-2]);
+			mom_pred[m] = over_m * ((2.0*(m-1)+1.0)*pval*mom_pred[m-1] - (m-1.0)*mom_pred[m-2]);
+		}
+		
+		// Normalize by sqrt legendre integral
+		//  see  cvpr-how-version/copula/scale_legendre.c
+		//  for derivation.   these numbers are the 
+		//  inverse sqrt of the output of this program.
+		mom_obs[0] *= 0.7071067811865475;
+		mom_obs[1] *= 1.2247448713915889;
+		mom_obs[2] *= 1.5811388300841895;
+		mom_obs[3] *= 1.8708286933869702;
+		mom_obs[4] *= 2.1213203435596424;
+		mom_obs[5] *= 2.3452078799117273;
+		mom_obs[6] *= 2.5495097567963381;
+		mom_obs[7] *= 2.7386127875255206;
+		mom_obs[8] *= 2.9154759474239764;
+		mom_obs[9] *= 3.0822070014802825;
+		mom_obs[10] *= 3.0403539085279343;
+		mom_pred[0] *= 0.7071067811865475;
+		mom_pred[1] *= 1.2247448713915889;
+		mom_pred[2] *= 1.5811388300841895;
+		mom_pred[3] *= 1.8708286933869702;
+		mom_pred[4] *= 2.1213203435596424;
+		mom_pred[5] *= 2.3452078799117273;
+		mom_pred[6] *= 2.5495097567963381;
+		mom_pred[7] *= 2.7386127875255206;
+		mom_pred[8] *= 2.9154759474239764;
+		mom_pred[9] *= 3.0822070014802825;
+		mom_pred[10] *= 3.0403539085279343;
+
+		// Add to our copula for the batch
+		for (int mo=0; mo<M; mo++) {
+			for (int mp=0; mp<M; mp++) {
+				atomicAdd(&(local_copula[mo][mp]), mom_obs[mo]*mom_pred[mp]);
+			}
+		}
+	}
+
+	__syncthreads();
+
+	// Write to global   (only one block per feature, so no conflicts)
+	if (tidx<(MAX_LEGENDRE_MOMENTS*MAX_LEGENDRE_MOMENTS)) {          // Assumes bdim>MAX_LEGENDRE_MOMENTS^2 which should
+		int mo = tidx/MAX_LEGENDRE_MOMENTS;                      //  always be true   bdim=256   MAX_LEGENDRE_MOMENTS^2=121
+		int mp = tidx - (mo*MAX_LEGENDRE_MOMENTS);
+		copula_data[mo*M*F + mp*F + f]  +=   local_copula[mo][mp];
+	}
+}
+
+//----------------------------
+// Legendre polynomial copula
+// output:
+//    copula  [M M F]     (float32)     obs-vs-pred Legendre copula
+// input:
+//    obs:       [N F]    (float32)     PIT of obs values
+//    pred:      [N F]    (float32)     PIT of pred values
+//----------------------------
+void copula_legendre_cuda(
+	torch::Tensor copula,
+	torch::Tensor obs,
+	torch::Tensor pred)
+{
+	//printf("BEGIN copula_legendre_cuda\n");   fflush(stdout);
+
+	// Pointer into the data
+	float *copula_data = copula.data_ptr<float>();
+	float *obs_data    = obs.data_ptr<float>();
+	float *pred_data   = pred.data_ptr<float>();
+	
+	// Check shapes
+	int cM1 = copula.sizes()[0];
+	int cM2 = copula.sizes()[1];
+	int cF  = copula.sizes()[2];
+	int oN  = obs.sizes()[0];
+	int oF  = obs.sizes()[1];
+	int pN  = pred.sizes()[0];
+	int pF  = pred.sizes()[1];
+	if (cM1!=cM2) {
+		printf("copula_legendre_cuda  num moments mismatch\n");   fflush(stdout);
+		exit(1);
+	}
+	if (cM1>MAX_LEGENDRE_MOMENTS) {
+		printf("ERROR: cM1 too many legendre moments\n");   fflush(stdout);
+		exit(1);
+	}
+	if (cF!=oF || cF!=pF) {
+		printf("copula_legendre_cuda  numFeatures mismatch\n");   fflush(stdout);
+		exit(1);
+	}
+	if (oN!=pN) {
+		printf("copula_legendre_cuda  num values mismatch\n");   fflush(stdout);
+		exit(1);
+	}
+	
+	// Run the kernel
+	copula_legendre_kernel<<<cF, 256>>>(
+		copula_data,
+		obs_data,
+		pred_data,
+		cM1, oN, cF);
+	
+	
+	//printf("END   copula_legendre_cuda\n");   fflush(stdout);
+}
+
+
+//----------------------------
+// Plot the Legendre copula
+// output:
+//    plot   [Y X F]
+// input:
+//    copula [M M F]
+//    Y X F  plot size
+//    M      num moments
+//----------------------------
+__global__
+void plot_copula_legendre_kernel(
+	float* __restrict__ plot,
+	const float* __restrict__ copula,
+	int Y, int X, int F, int M)
+{
+	__shared__ float local_mom_obs[16][32][MAX_LEGENDRE_MOMENTS];
+	__shared__ float local_mom_pred[16][32][MAX_LEGENDRE_MOMENTS];
+
+	// Where am I ?
+	int ix = blockDim.x*blockIdx.x + threadIdx.x;
+	int iy = blockDim.y*blockIdx.y + threadIdx.y;
+	int iz = blockDim.z*blockIdx.z + threadIdx.z;
+	
+	// Am I off the map ?
+	if (ix>=X || iy>=Y || iz>=F)
+		return;
+
+	// Pointer into local storage
+	float *mom_obs  = local_mom_obs[threadIdx.y][threadIdx.x];
+	float *mom_pred = local_mom_pred[threadIdx.y][threadIdx.x];
+
+	// Where am I (range [0.0 to 1.0])
+	float fx = ((float)ix + 0.5) / X;
+	float fy = ((float)iy + 0.5) / Y;
+	
+	// Rescale (range [-1.0 to 1.0])
+	fx = 2.0*fx - 1.0;
+	fy = 2.0*fy - 1.0;
+	
+	// Plug into legendre moments
+	mom_obs[0] = 1.0;
+	mom_obs[1] = fy;
+	mom_pred[0] = 1.0;
+	mom_pred[1] = fx;
+
+	// Bonnet's recurrence		
+	for (int m=2; m<M; m++) {
+		float over_m = 1.0 / m;
+		mom_obs[m]  = over_m * ((2.0*(m-1)+1.0)*fy*mom_obs[m-1]  - (m-1.0)*mom_obs[m-2]);
+		mom_pred[m] = over_m * ((2.0*(m-1)+1.0)*fx*mom_pred[m-1] - (m-1.0)*mom_pred[m-2]);
+	}
+	
+	// Normalize by sqrt legendre integral
+	//  see  cvpr-how-version/copula/scale_legendre.c
+	//  for derivation.   these numbers are the 
+	//  inverse sqrt of the output of this program.
+	mom_obs[0] *= 0.7071067811865475;
+	mom_obs[1] *= 1.2247448713915889;
+	mom_obs[2] *= 1.5811388300841895;
+	mom_obs[3] *= 1.8708286933869702;
+	mom_obs[4] *= 2.1213203435596424;
+	mom_obs[5] *= 2.3452078799117273;
+	mom_obs[6] *= 2.5495097567963381;
+	mom_obs[7] *= 2.7386127875255206;
+	mom_obs[8] *= 2.9154759474239764;
+	mom_obs[9] *= 3.0822070014802825;
+	mom_obs[10] *= 3.0403539085279343;
+	mom_pred[0] *= 0.7071067811865475;
+	mom_pred[1] *= 1.2247448713915889;
+	mom_pred[2] *= 1.5811388300841895;
+	mom_pred[3] *= 1.8708286933869702;
+	mom_pred[4] *= 2.1213203435596424;
+	mom_pred[5] *= 2.3452078799117273;
+	mom_pred[6] *= 2.5495097567963381;
+	mom_pred[7] *= 2.7386127875255206;
+	mom_pred[8] *= 2.9154759474239764;
+	mom_pred[9] *= 3.0822070014802825;
+	mom_pred[10] *= 3.0403539085279343;
+	
+	// Calculate the plot value
+	float sum = 0.0;
+	for (int mo=0; mo<M; mo++) {
+		for (int mp=0; mp<M; mp++) {
+			sum += copula[mo*M*F + mp*F + iz] * mom_obs[mo]*mom_pred[mp];
+		}
+	}
+	plot[iy*X*F + ix*F + iz] = sum;   // save the plot pixel
+}
+
+
+//----------------------------
+// Plot the Legendre copula
+// output:
+//    plot   [Y X F]
+// input:
+//    copula [M M F]
+//----------------------------
+void plot_copula_legendre_cuda(
+	torch::Tensor plot,
+	torch::Tensor copula)
+{
+	printf("BEGIN plot_copula_legendre_cuda\n");   fflush(stdout);
+
+	// Pointer into the data
+	float *plot_data   = plot.data_ptr<float>();
+	float *copula_data = copula.data_ptr<float>();
+	
+	// Check shapes
+	int pY  = plot.sizes()[0];
+	int pX  = plot.sizes()[1];
+	int pF  = plot.sizes()[2];
+	int cM1 = copula.sizes()[0];
+	int cM2 = copula.sizes()[1];
+	int cF  = copula.sizes()[2];
+	if (cM1!=cM2) {
+		printf("plot_copula_legendre_cuda  num moments mismatch\n");   fflush(stdout);
+		exit(1);
+	}
+	if (cF!=pF) {
+		printf("plot_copula_legendre_cuda  numFeatures mismatch\n");   fflush(stdout);
+		exit(1);
+	}
+	
+	// Run the kernel
+	dim3 nBlk, nThr;
+	nThr.x = 32;
+	nThr.y = 16;
+	nThr.z = 1;
+	nBlk.x = (pX+nThr.x-1)/nThr.x;
+	nBlk.y = (pY+nThr.y-1)/nThr.y;
+	nBlk.z = (pF+nThr.z-1)/nThr.z;
+	plot_copula_legendre_kernel<<<nBlk, nThr>>>(
+		plot_data,
+		copula_data,
+		pY, pX, pF, cM1);
+	
+	
+	printf("END   plot_copula_legendre_cuda\n");   fflush(stdout);
+}
+
+
+
+
+
+
+
 
 

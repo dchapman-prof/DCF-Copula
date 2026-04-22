@@ -57,24 +57,27 @@ __global__ void histogram_kernel(
 		//
 		float val = x[n*F + f];
 		//printf("**  rank %d val %.3f\n", rank, val);
-		int bin_lo  = 0;
-		int bin_hi  = B;
-		while (bin_hi-bin_lo > 1)
-		{
-			int bin_mid = (bin_lo+bin_hi) / 2;
-			float val_mid = steps[bin_mid];
-			
-			if (val<val_mid) {
-				bin_hi = bin_mid;
-			} else {
-				bin_lo = bin_mid;
+		if (val>=steps[0] && val<=steps[B])
+		{			
+			int bin_lo  = 0;
+			int bin_hi  = B;
+			while (bin_hi-bin_lo > 1)
+			{
+				int bin_mid = (bin_lo+bin_hi) / 2;
+				float val_mid = steps[bin_mid];
+				
+				if (val<val_mid) {
+					bin_hi = bin_mid;
+				} else {
+					bin_lo = bin_mid;
+				}
 			}
+			
+			//
+			// Add to the bin
+			//
+			atomicAdd(&count[bin_lo], 1);
 		}
-		
-		//
-		// Add to the bin
-		//
-		atomicAdd(&count[bin_lo], 1);
 	}
 
 	//
@@ -194,50 +197,55 @@ void histogram_2d_kernel(
 
 	if (n<N)
 	{
-		
-		//
-		// Find the correct histogram bin in A (binary search)
-		//
+
+		// Read the values
 		float val_a = a_data[n*F + f];
-		int bin_lo  = 0;
-		int bin_hi  = A;
-		while (bin_hi-bin_lo > 1)
-		{
-			int bin_mid = (bin_lo+bin_hi) / 2;
-			float val_mid = steps_a[bin_mid];
-			
-			if (val_a<val_mid) {
-				bin_hi = bin_mid;
-			} else {
-				bin_lo = bin_mid;
-			}
-		}
-		int bin_a = bin_lo;
-
-		//
-		// Find the correct histogram bin in B (binary search)
-		//
 		float val_b = b_data[n*F + f];
-		bin_lo  = 0;
-		bin_hi  = B;
-		while (bin_hi-bin_lo > 1)
-		{
-			int bin_mid = (bin_lo+bin_hi) / 2;
-			float val_mid = steps_b[bin_mid];
-			
-			if (val_b<val_mid) {
-				bin_hi = bin_mid;
-			} else {
-				bin_lo = bin_mid;
-			}
-		}
-		int bin_b = bin_lo;
 
-		
-		//
-		// Add to the bin
-		//
-		atomicAdd(&count[bin_a*B + bin_b], 1);
+		// If the values are on the map
+		if (val_a>=steps_a[0] && val_a<=steps_a[A] & val_b>=steps_b[0] && val_b<=steps_b[B])
+		{
+			//
+			// Find the correct histogram bin in A (binary search)
+			//
+			int bin_lo  = 0;
+			int bin_hi  = A;
+			while (bin_hi-bin_lo > 1)
+			{
+				int bin_mid = (bin_lo+bin_hi) / 2;
+				float val_mid = steps_a[bin_mid];
+				
+				if (val_a<val_mid) {
+					bin_hi = bin_mid;
+				} else {
+					bin_lo = bin_mid;
+				}
+			}
+			int bin_a = bin_lo;
+
+			//
+			// Find the correct histogram bin in B (binary search)
+			//
+			bin_lo  = 0;
+			bin_hi  = B;
+			while (bin_hi-bin_lo > 1)
+			{
+				int bin_mid = (bin_lo+bin_hi) / 2;
+				float val_mid = steps_b[bin_mid];
+				
+				if (val_b<val_mid) {
+					bin_hi = bin_mid;
+				} else {
+					bin_lo = bin_mid;
+				}
+			}
+			int bin_b = bin_lo;
+
+			//
+			// Add to the bin
+			//
+			atomicAdd(&count[bin_a*B + bin_b], 1);	
+		}
 	}
 
 	//

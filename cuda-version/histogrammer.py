@@ -322,7 +322,6 @@ def test():
 			hg.begin_epoch()
 
 			for b in range(n_batch):
-
 				hg.add_batch(batches[b])
 			hg.end_epoch()
 
@@ -353,8 +352,8 @@ def test():
 		for b in range(n_batch//2):
 			print('  >batch', b, flush=True)
 			obs  = batches[2*b]
-			pred = batches[2*b+1]
-			#pred = 0.7*batches[2*b] + 0.3*batches[2*b+1]
+			#pred = batches[2*b+1]
+			pred = 0.7*batches[2*b] + 0.3*batches[2*b+1]
 						
 			copula_batch = hg.copula_legendre(obs, pred, nMoments)
 			copula += copula_batch

@@ -28,7 +28,8 @@ def Compile():
 	print(hgm__cuda_source)
 
 	hgm__cpp_source = '''
-		torch::Tensor histogram_cuda(torch::Tensor x, torch::Tensor steps);
+		void histogram_cuda(torch::Tensor count, torch::Tensor x, torch::Tensor steps);
+		void histogram_2d_cuda(torch::Tensor count, torch::Tensor a, torch::Tensor b, torch::Tensor steps_a, torch::Tensor steps_b);
 		torch::Tensor quantiles_cuda(torch::Tensor count, torch::Tensor steps);
 		void quantiles_bounds_cuda(torch::Tensor guess_steps, torch::Tensor quantiles_lo_x, torch::Tensor quantiles_lo_y, torch::Tensor quantiles_hi_x, torch::Tensor quantiles_hi_y, torch::Tensor count, torch::Tensor steps);
 		void cdf_cuda(torch::Tensor cdf, torch::Tensor count);
@@ -70,13 +71,12 @@ def Compile():
 class Histogrammer():
 	
 	@torch.no_grad()
-	def __init__(self, device, nFilters, nBins=10000, megabatch_size=32768):
+	def __init__(self, device, nFilters, nBins=10000):
 	
 		self.epoch = 0
 		self.device = device
 		self.nFilters = nFilters
 		self.nBins = nBins
-		self.megabatch_size = megabatch_size
 		self.curr_size = 0
 	
 		# Make sure the histogram module is compiled
@@ -84,7 +84,7 @@ class Histogrammer():
 			Compile()
 			
 		# Allocate the bounds and megabatch
-		self.megabatch = torch.zeros((nFilters,megabatch_size), dtype=torch.float32, device=device, requires_grad=False)
+		#self.megabatch = torch.zeros((nFilters,megabatch_size), dtype=torch.float32, device=device, requires_grad=False)
 
 		# Allocate the global histogram
 		self.histogram = torch.zeros((nFilters,nBins), dtype=torch.int64, device=device, requires_grad=False)
@@ -143,65 +143,19 @@ class Histogrammer():
 		# All other epochs we build the histogram
 		else:
 
-			# if we do not have enough space,
-			#  then flush the megabatch
-			if self.curr_size+batch_size > self.megabatch_size:
-				self.flush()
-			
-			# append the transposed batch to the megabatch
-			sidx = self.curr_size
-			eidx = sidx + batch_size
-			self.curr_size = eidx
-			
-			#print('megabatch', self.megabatch.shape)
-			#print('sidx', sidx, 'eidx', eidx)
-			#print('x', x.shape)
-			self.megabatch[:,sidx:eidx] = x.transpose(0,1).contiguous()
-			
-		#print('    END add_batch')
-	
-	@torch.no_grad()	
-	def flush(self):
-		
-		#print('      BEGIN flush')
-		
-		# If the megabatch is empty there is nothing to flush
-		if self.curr_size==0:
-			return
-		
-		# Else we flush by running the CUDA kernel
-		for f in range(self.nFilters):
-			
-			#print('        flush f', f,  'nFilters', self.nFilters)
-			
-			# Input tensors x, steps
-			#print('        Input tensors x, steps')
-			#count = torch.zeros((self.nBins,), dtype=torch.int32, device=self.device)
-			x     = self.megabatch[f,0:self.curr_size].contiguous()
-			steps = self.steps[f].contiguous()
-						
-			# Run the CUDA kernel for the module
-			#print('        Run the CUDA kernel for the module')
+			x_contig = x.contiguous()
+			count = torch.zeros((self.nFilters, self.nBins), dtype=torch.int32, requires_grad=False, device=self.device)
+
 			torch.cuda.synchronize()
-			count = hgm__module.histogram_cuda(x, steps)
-			#print('        torch.cuda.synchronize()')
+			hgm__module.histogram_cuda(count, x_contig, self.steps)
 			torch.cuda.synchronize()
-		
-			#print('         count', count)
-		
-			# Update the histogram
-			#print('        Update the histogram')
-			self.histogram[f] = self.histogram[f] + count
 			
-		# We are flushed
-		self.curr_size = 0
-		
-		#print('      END flush')
-	
+			self.histogram += count
+
 	@torch.no_grad()
 	def end_epoch(self):
 		
-		self.flush()
+		#self.flush()
 		
 		if self.epoch==0:
 
@@ -328,23 +282,21 @@ class Histogrammer():
 
 
 
-print('---------------------------------------------')
-print('---------------------------------------------')
-print('Construct histogrammer')
-print('---------------------------------------------')
-print('---------------------------------------------')
 
 def test():
 
+	print('---------------------------------------------')
+	print(' Test histogrammer')
+	print('---------------------------------------------')
 
 	device='cuda'
 	nFilters = 10
 	nBins = 10
 	batch_size = 1000
 	n_batch = 100
-	megabatch_size = 32768  #1024
+	#megabatch_size = 32768  #1024
 
-	hg = Histogrammer(device, nFilters, nBins, megabatch_size)
+	hg = Histogrammer(device, nFilters, nBins)#, megabatch_size)
 
 	hg_epochs = 2
 
@@ -429,3 +381,85 @@ if __name__ == "__main__":
 	test()
 
 	
+
+
+
+
+
+
+
+
+
+
+#--------------------------------------------
+# DEPRECATED
+#--------------------------------------------
+
+	
+	#@torch.no_grad()	
+	#def flush(self):
+		
+		#print('      BEGIN flush')
+		
+		# If the megabatch is empty there is nothing to flush
+		#if self.curr_size==0:
+		#	return
+		
+		
+		# Flush by running the CUDA kernel
+		#x = self.megabatch[:,0:self.curr_size].contiguous()
+		
+	#	torch.cuda.synchronize()
+	#	hgm__module.histogram_cuda(self.histogram, x, steps)
+	#	torch.cuda.synchronize()
+		
+		
+
+	#	# Else we flush by running the CUDA kernel
+	#	for f in range(self.nFilters):
+			
+	#		#print('        flush f', f,  'nFilters', self.nFilters)
+			
+	#		# Input tensors x, steps
+	#		#print('        Input tensors x, steps')
+	#		#count = torch.zeros((self.nBins,), dtype=torch.int32, device=self.device)
+	#		x     = self.megabatch[f,0:self.curr_size].contiguous()
+	#		steps = self.steps[f].contiguous()
+						
+	#		# Run the CUDA kernel for the module
+	#		#print('        Run the CUDA kernel for the module')
+	#		torch.cuda.synchronize()
+	#		count = hgm__module.histogram_cuda(x, steps)
+	#		#print('        torch.cuda.synchronize()')
+	#		torch.cuda.synchronize()
+		
+	#		#print('         count', count)
+		
+	#		# Update the histogram
+	#		#print('        Update the histogram')
+	#		self.histogram[f] = self.histogram[f] + count
+
+		
+	#	# We are flushed
+	#	self.curr_size = 0
+		
+	#	#print('      END flush')
+	
+
+			# if we do not have enough space,
+			#  then flush the megabatch
+			#if self.curr_size+batch_size > self.megabatch_size:
+			#	self.flush()
+			
+			# append the transposed batch to the megabatch
+			#sidx = self.curr_size
+			#eidx = sidx + batch_size
+			#self.curr_size = eidx
+			
+			#print('megabatch', self.megabatch.shape)
+			#print('sidx', sidx, 'eidx', eidx)
+			#print('x', x.shape)
+			#self.megabatch[:,sidx:eidx] = x.transpose(0,1).contiguous()
+			
+		#print('    END add_batch')
+

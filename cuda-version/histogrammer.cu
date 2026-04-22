@@ -2,26 +2,26 @@
 #include <cstdio>
 #include <torch/extension.h>
 
-#define N_THREADS  1024
-
 //----------------------
 //  Histogram Kernel
+//  in/out:
+//   count    [F B]     (int32)
 //  input:
-//     x        [N]
-//   in_steps  [B+1]
-//
-//  output:
-//   out_count  [B]
+//     x      [N F]     (float32)
+//   steps    [F B+1]   (float32)
 //-----------------------
-__global__ void histogram_kernel(int* out_count, const float* x, const float *in_steps, int N, int B) 
+__global__ void histogram_kernel(
+	int* __restrict__    out_count,
+	const float* __restrict__ x,
+	const float* __restrict__ in_steps,
+	int F, int N, int B) 
 {
 	//printf("BEGIN histogram_kernel\n");
 
 	// Who am I ?
-	int bid = blockIdx.x;
-	int tid = threadIdx.x;
-	int n_thread = blockDim.x;
-	int rank = bid * n_thread + tid;
+	int n = blockIdx.x*blockDim.x + threadIdx.x;
+	int f = blockIdx.y;
+
 
 	//
 	// Allocate the shared count and steps
@@ -33,29 +33,29 @@ __global__ void histogram_kernel(int* out_count, const float* x, const float *in
 	//
 	// Initialize the shared memory
 	//
-	int count_start = (B * tid) / n_thread;
-	int count_end   = (B * (tid+1)) / n_thread; 
-	int steps_start = ((B+1) * tid) / n_thread;
-	int steps_end   = ((B+1) * (tid+1)) / n_thread; 
+	int count_start = (B * threadIdx.x) / blockDim.x;
+	int count_end   = (B * (threadIdx.x+1)) / blockDim.x; 
+	int steps_start = ((B+1) * threadIdx.x) / blockDim.x;
+	int steps_end   = ((B+1) * (threadIdx.x+1)) / blockDim.x; 
 	//printf("rank  %d  count %d : %d  steps %d : %d  N %d B %d\n", 
 	//	rank, count_start, count_end, steps_start, steps_end, N, B);
 	for (int i=count_start; i<count_end; i++)
 		count[i] = 0;
 	for (int i=steps_start; i<steps_end; i++)
-		steps[i] = in_steps[i];
+		steps[i] = in_steps[f*(B+1) + i];
 	__syncthreads();
 
 	//
 	// If we are even in the problem
 	//
 
-	if (rank<N)
+	if (n<N)
 	{
 		
 		//
 		// Find the correct histogram bin (binary search)
 		//
-		float val = x[rank];
+		float val = x[n*F + f];
 		//printf("**  rank %d val %.3f\n", rank, val);
 		int bin_lo  = 0;
 		int bin_hi  = B;
@@ -82,65 +82,232 @@ __global__ void histogram_kernel(int* out_count, const float* x, const float *in
 	//
 	__syncthreads();
 		
-	if (rank<N)
+	if (n<N)
 	{
 		//
 		// Add to the overall output
 		//
 		for (int i=count_start; i<count_end; i++) {
-			atomicAdd(&out_count[i], count[i]);
+			atomicAdd(&out_count[f*B + i], count[i]);
 		}
 	}
-
-
-	//printf("END histogram_kernel\n");
 }
 
 
 //----------------------
 //  Histogram Cuda
-//  output:
-//   count    [B]     (int32)
+//  in/out:
+//   count    [F B]     (int32)
 //  input:
-//     x      [N]     (float32)
-//   steps    [B+1]   (float32)
+//     x      [N F]     (float32)
+//   steps    [F B+1]   (float32)
 //-----------------------
-torch::Tensor histogram_cuda(torch::Tensor x, torch::Tensor steps)
+void histogram_cuda(
+	torch::Tensor count,
+	torch::Tensor x,
+	torch::Tensor steps)
 {
-	//printf("BEGIN histogram_cuda\n");
+	printf("BEGIN histogram_cuda\n");
 
 	// Pointer to the data
-	float *x_data      = x.data_ptr<float>();
-	float *steps_data  = steps.data_ptr<float>();
+	int* count_data      = count.data_ptr<int>();
+	float*   x_data      = x.data_ptr<float>();
+	float*   steps_data  = steps.data_ptr<float>();
 	
 	// What are the shapes of the input tensors
 	int N = x.sizes()[0];
-	int B = steps.sizes()[0] - 1;
-	
-	// Construct count [B]
-	auto options = torch::TensorOptions()
-		.dtype(torch::kInt32)  // Data type (e.g., kInt, kDouble, kHalf)
-		.device(torch::kCUDA)    // Device (kCPU or kCUDA)
-		.requires_grad(false);   // Autograd tracking
-	torch::Tensor count = torch::zeros({B}, options);
-	int   *count_data  = count.data_ptr<int>();
+	int F = x.sizes()[1];
+	int B = steps.sizes()[1] - 1;
+
+	// Arrange the blocks
+	dim3 nThr(256,1);
+	dim3 nBlk((N+255)/256, F);
 	
 	// Allocate shared memory
 	size_t shared_size = (2*B + 1) * sizeof(float);
 	
-	//printf("(N + (N_THREADS-1)) / N_THREADS  %d\n", (N + (N_THREADS-1)) / N_THREADS);
-	//printf("N_THREADS                        %d\n", N_THREADS);
-	//printf("shared_size                      %d\n", shared_size);
-	//printf("N %d  B %d\n", N, B);
+	// Run the kernel
+	histogram_kernel<<<nBlk, nThr, shared_size>>>(
+	  count_data, x_data, steps_data, F, N, B);
+
+	printf("END histogram_cuda\n");
+}
+
+
+
+//----------------------
+//  Histogram2D
+//  output:
+//   count    [F A B]     (int32)
+//  input:
+//     a      [N F]     (float32)
+//     b      [N F]     (float32)
+//   steps_a  [F A+1]   (float32)
+//   steps_b  [F B+1]   (float32)
+//----------------------
+__global__
+void histogram_2d_kernel(
+	int* __restrict__ count_data,
+	const float* __restrict__ a_data,
+	const float* __restrict__ b_data,
+	const float* __restrict__ steps_a_data,
+	const float* __restrict__ steps_b_data,
+	int F, int N, int A, int B)
+{
+	//printf("BEGIN histogram_kernel\n");
+
+	// Who am I ?
+	int n = blockIdx.x*blockDim.x + threadIdx.x;
+	int f = blockIdx.y;
+
+
+	//
+	// Allocate the shared count and steps
+	//
+	extern __shared__ float s_data[];
+	int   *count = (int*)s_data;                    // [A*B]
+	float *steps_a = (float*)(s_data + A*B);        // [A+1]
+	float *steps_b = (float*)(s_data + A*B + A+1);  // [B+1]
+
+	//
+	// Initialize the shared memory
+	//
+	int count_start = (A*B * threadIdx.x) / blockDim.x;
+	int count_end   = (A*B * (threadIdx.x+1)) / blockDim.x; 
+	int steps_a_start = ((A+1) * threadIdx.x) / blockDim.x;
+	int steps_a_end   = ((A+1) * (threadIdx.x+1)) / blockDim.x; 
+	int steps_b_start = ((A+1) * threadIdx.x) / blockDim.x;
+	int steps_b_end   = ((A+1) * (threadIdx.x+1)) / blockDim.x; 
+	//printf("rank  %d  count %d : %d  steps %d : %d  N %d B %d\n", 
+	//	rank, count_start, count_end, steps_start, steps_end, N, B);
+	for (int i=count_start; i<count_end; i++)
+		count[i] = 0;
+	for (int i=steps_a_start; i<steps_a_end; i++)
+		steps_a[i] = steps_a_data[f*(A+1) + i];
+	for (int i=steps_b_start; i<steps_b_end; i++)
+		steps_b[i] = steps_b_data[f*(B+1) + i];
+	__syncthreads();
+
+	//
+	// If we are even in the problem
+	//
+
+	if (n<N)
+	{
+		
+		//
+		// Find the correct histogram bin in A (binary search)
+		//
+		float val_a = a_data[n*F + f];
+		int bin_lo  = 0;
+		int bin_hi  = A;
+		while (bin_hi-bin_lo > 1)
+		{
+			int bin_mid = (bin_lo+bin_hi) / 2;
+			float val_mid = steps_a[bin_mid];
+			
+			if (val_a<val_mid) {
+				bin_hi = bin_mid;
+			} else {
+				bin_lo = bin_mid;
+			}
+		}
+		int bin_a = bin_lo;
+
+		//
+		// Find the correct histogram bin in B (binary search)
+		//
+		float val_b = b_data[n*F + f];
+		bin_lo  = 0;
+		bin_hi  = B;
+		while (bin_hi-bin_lo > 1)
+		{
+			int bin_mid = (bin_lo+bin_hi) / 2;
+			float val_mid = steps_b[bin_mid];
+			
+			if (val_b<val_mid) {
+				bin_hi = bin_mid;
+			} else {
+				bin_lo = bin_mid;
+			}
+		}
+		int bin_b = bin_lo;
+
+		
+		//
+		// Add to the bin
+		//
+		atomicAdd(&count[bin_a*B + bin_b], 1);
+	}
+
+	//
+	// Global barrier
+	//
+	__syncthreads();
+		
+	if (n<N)
+	{
+		//
+		// Add to the overall output
+		//
+		for (int i=count_start; i<count_end; i++) {
+			atomicAdd(&count_data[f*A*B + i], count[i]);
+		}
+	}
+}
+
+
+//----------------------
+//  Histogram2D
+//  output:
+//   count    [F A B]     (int32)
+//  input:
+//     a      [N F]     (float32)
+//     b      [N F]     (float32)
+//   steps_a  [F A+1]   (float32)
+//   steps_b  [F B+1]   (float32)
+//-----------------------
+void histogram_2d_cuda(
+	torch::Tensor count,
+	torch::Tensor a,
+	torch::Tensor b,
+	torch::Tensor steps_a,
+	torch::Tensor steps_b)
+{
+	//printf("BEGIN histogram_cuda\n");
+
+	// Pointer to the data
+	int     *count_data = count.data_ptr<int>();
+	float   *a_data   = a.data_ptr<float>();
+	float   *b_data   = a.data_ptr<float>();
+	float   *steps_a_data   = steps_a.data_ptr<float>();
+	float   *steps_b_data   = steps_b.data_ptr<float>();
+	
+	// Get the sizes
+	int F = count.sizes()[0];
+	int N = a.sizes()[0];
+	int A = count.sizes()[1];
+	int B = count.sizes()[2];
+
+	// Allocate shared memory
+	size_t shared_size = (A*B + A+1 + B+1) * sizeof(float);
+	
+	dim3 nThr(256,1);
+	dim3 nBlk((N+255)/256, F);
 	
 	// Run the kernel
-	histogram_kernel<<<(N + (N_THREADS-1)) / N_THREADS, N_THREADS, shared_size>>>(
-	  count_data, x_data, steps_data, N, B);
+	histogram_2d_kernel<<<nBlk,nThr,shared_size>>>(
+		count_data,
+		a_data, b_data,
+		steps_a_data, steps_b_data,
+		F, N, A, B);
 	  
 	//printf("END histogram_cuda\n");
-
-	return count;
 }
+
+
+
+
 
 
 
@@ -279,7 +446,7 @@ torch::Tensor quantiles_cuda(torch::Tensor count, torch::Tensor steps)
 	//printf("40\n");
 
 	// Run the kernel
-	quantiles_kernel<<<(F + (N_THREADS-1)) / N_THREADS, N_THREADS>>>(quantiles_data, count_data, steps_data, F, B);
+	quantiles_kernel<<<(F+255)/256, 256>>>(quantiles_data, count_data, steps_data, F, B);
 
 	std::cout << "END quantiles_cuda" << std::endl;
 
@@ -503,7 +670,7 @@ void quantiles_bounds_cuda(
 	int B = count.sizes()[1];
 	
 	// Run the kernel
-	quantiles_bounds_kernel<<<(F + (N_THREADS-1)) / N_THREADS, N_THREADS>>>(
+	quantiles_bounds_kernel<<<(F+255)/256, 256>>>(
 		guess_steps_data,
 		quantiles_lo_x_data,
 		quantiles_lo_y_data,
@@ -1065,3 +1232,149 @@ void plot_copula_legendre_cuda(
 
 
 
+
+
+/*
+**********************************************
+* DEPRECATED BELOW
+**********************************************
+
+
+//----------------------
+//  Histogram Kernel
+//  input:
+//     x        [N]
+//   in_steps  [B+1]
+//
+//  output:
+//   out_count  [B]
+//-----------------------
+__global__ void histogram_kernel(int* out_count, const float* x, const float *in_steps, int N, int B) 
+{
+	//printf("BEGIN histogram_kernel\n");
+
+	// Who am I ?
+	int bid = blockIdx.x;
+	int tid = threadIdx.x;
+	int n_thread = blockDim.x;
+	int rank = bid * n_thread + tid;
+
+	//
+	// Allocate the shared count and steps
+	//
+	extern __shared__ float s_data[];
+	int   *count = (int*)s_data;          // [B]
+	float *steps = (float*)(s_data + B);  // [B+1]
+
+	//
+	// Initialize the shared memory
+	//
+	int count_start = (B * tid) / n_thread;
+	int count_end   = (B * (tid+1)) / n_thread; 
+	int steps_start = ((B+1) * tid) / n_thread;
+	int steps_end   = ((B+1) * (tid+1)) / n_thread; 
+	//printf("rank  %d  count %d : %d  steps %d : %d  N %d B %d\n", 
+	//	rank, count_start, count_end, steps_start, steps_end, N, B);
+	for (int i=count_start; i<count_end; i++)
+		count[i] = 0;
+	for (int i=steps_start; i<steps_end; i++)
+		steps[i] = in_steps[i];
+	__syncthreads();
+
+	//
+	// If we are even in the problem
+	//
+
+	if (rank<N)
+	{
+		
+		//
+		// Find the correct histogram bin (binary search)
+		//
+		float val = x[rank];
+		//printf("**  rank %d val %.3f\n", rank, val);
+		int bin_lo  = 0;
+		int bin_hi  = B;
+		while (bin_hi-bin_lo > 1)
+		{
+			int bin_mid = (bin_lo+bin_hi) / 2;
+			float val_mid = steps[bin_mid];
+			
+			if (val<val_mid) {
+				bin_hi = bin_mid;
+			} else {
+				bin_lo = bin_mid;
+			}
+		}
+		
+		//
+		// Add to the bin
+		//
+		atomicAdd(&count[bin_lo], 1);
+	}
+
+	//
+	// Global barrier
+	//
+	__syncthreads();
+		
+	if (rank<N)
+	{
+		//
+		// Add to the overall output
+		//
+		for (int i=count_start; i<count_end; i++) {
+			atomicAdd(&out_count[i], count[i]);
+		}
+	}
+
+
+	//printf("END histogram_kernel\n");
+}
+
+
+//----------------------
+//  Histogram Cuda
+//  output:
+//   count    [B]     (int32)
+//  input:
+//     x      [N]     (float32)
+//   steps    [B+1]   (float32)
+//-----------------------
+torch::Tensor histogram_cuda(torch::Tensor x, torch::Tensor steps)
+{
+	//printf("BEGIN histogram_cuda\n");
+
+	// Pointer to the data
+	float *x_data      = x.data_ptr<float>();
+	float *steps_data  = steps.data_ptr<float>();
+	
+	// What are the shapes of the input tensors
+	int N = x.sizes()[0];
+	int B = steps.sizes()[0] - 1;
+	
+	// Construct count [B]
+	auto options = torch::TensorOptions()
+		.dtype(torch::kInt32)  // Data type (e.g., kInt, kDouble, kHalf)
+		.device(torch::kCUDA)    // Device (kCPU or kCUDA)
+		.requires_grad(false);   // Autograd tracking
+	torch::Tensor count = torch::zeros({B}, options);
+	int   *count_data  = count.data_ptr<int>();
+	
+	// Allocate shared memory
+	size_t shared_size = (2*B + 1) * sizeof(float);
+	
+	//printf("(N + (N_THREADS-1)) / N_THREADS  %d\n", (N + (N_THREADS-1)) / N_THREADS);
+	//printf("N_THREADS                        %d\n", N_THREADS);
+	//printf("shared_size                      %d\n", shared_size);
+	//printf("N %d  B %d\n", N, B);
+	
+	// Run the kernel
+	histogram_kernel<<<(N + (N_THREADS-1)) / N_THREADS, N_THREADS, shared_size>>>(
+	  count_data, x_data, steps_data, N, B);
+	  
+	//printf("END histogram_cuda\n");
+
+	return count;
+}
+*/

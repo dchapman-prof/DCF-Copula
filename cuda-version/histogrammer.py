@@ -36,6 +36,7 @@ def Compile():
 		void pit_cuda(torch::Tensor pit, torch::Tensor X, torch::Tensor cdf, torch::Tensor steps);
 		void copula_legendre_cuda(torch::Tensor copula, torch::Tensor obs, torch::Tensor pred);
 		void plot_copula_legendre_cuda(torch::Tensor plot,torch::Tensor copula);
+		int fit_distributions_cuda(torch::Tensor distr, torch::Tensor guess, torch::Tensor Y_mid, torch::Tensor cdf_Y_mid, torch::Tensor log_Yhat, torch::Tensor cdf_Yhat, int type, int metric, float Y0, torch::Tensor X, torch::Tensor cdf_Y, int seed);
 	'''
 
 	def get_cuda_arch_flags():
@@ -281,8 +282,81 @@ class Histogrammer():
 		cbar.ax.tick_params(labelsize=fontsize)		
 
 
+#------------------------------------
+# Quantile distribution code
+#------------------------------------
 
+# Q distribution types
+QDISTR_UNIFORM     = 0
+QDISTR_GAUSSIAN    = 1
+QDISTR_EXPONENTIAL = 2
+QDISTR_WEIBULL     = 3
+QDISTR_GPD         = 4
 
+# Q distribution metrics
+QD_METRIC_KL          = 0
+QD_METRIC_WASSERSTEIN = 1
+
+class QDistr():
+	
+	# Distribution structure tensor
+	DISTR_PARAM1        = 0
+	DISTR_PARAM2        = 1
+	DISTR_CROSS_ENTROPY = 2
+	DISTR_ENTROPY       = 3
+	DISTR_KL_DIVER      = 4
+	DISTR_WAS_DIST      = 5
+
+	# Guess structure tensor
+	GUESS_PARAM1        = 0
+	GUESS_PARAM2        = 1
+	GUESS_PARAM1_STEP   = 2
+	GUESS_PARAM2_STEP   = 3
+	
+	def __init__(self, nFilters, nBins, distrib_type, 
+		Y0, metric, seed=(42<<24), device='cuda'):
+
+		self.nFilters     = nFilters
+		self.nBins        = nBins
+		self.distrib_type = distrib_type
+		self.Y0           = Y0
+		self.metric       = metric
+		self.seed         = seed
+		self.device       = device
+	
+		# Make sure the histogram module is compiled
+		if hgm__module is None:
+			Compile()
+
+		# Allocate the distribution structure, and guess structure
+		self.distr     = torch.zeros((nFilters,6), dtype=torch.float32, device=device, requires_grad=False)
+		self.guess     = torch.zeros((nFilters,4), dtype=torch.float32, device=device, requires_grad=False)
+		self.Y_mid     = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
+		self.cdf_Y_mid = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
+		self.log_Yhat  = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
+		self.cdf_Yhat  = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
+
+	def fit(self, X, cdf_Y):
+		
+		X     = X.contiguous()
+		cdf_Y = cdf_Y.contiguous()
+		
+		torch.cuda.synchronize()
+		self.seed = hgm__module.fit_distributions_cuda(
+			self.distr,         # output:  [C 6]  float32
+			self.guess,         # output:  [C 4]  float32
+			self.Y_mid,         # output:  [C N]  float32
+			self.cdf_Y_mid,     # output:  [C N]  float32
+			self.log_Yhat,      # output:  [C N]  float32
+			self.cdf_Yhat,      # output:  [C N]  float32
+			self.distrib_type, self.metric,
+			self.Y0,
+			X,             # input:   [C N+1]
+			cdf_Y,         # input:   [C N+1]
+			self.seed);
+		torch.cuda.synchronize()
+		
+		
 def test():
 
 	print('---------------------------------------------')
@@ -380,85 +454,3 @@ if __name__ == "__main__":
 	test()
 
 	
-
-
-
-
-
-
-
-
-
-
-#--------------------------------------------
-# DEPRECATED
-#--------------------------------------------
-
-	
-	#@torch.no_grad()	
-	#def flush(self):
-		
-		#print('      BEGIN flush')
-		
-		# If the megabatch is empty there is nothing to flush
-		#if self.curr_size==0:
-		#	return
-		
-		
-		# Flush by running the CUDA kernel
-		#x = self.megabatch[:,0:self.curr_size].contiguous()
-		
-	#	torch.cuda.synchronize()
-	#	hgm__module.histogram_cuda(self.histogram, x, steps)
-	#	torch.cuda.synchronize()
-		
-		
-
-	#	# Else we flush by running the CUDA kernel
-	#	for f in range(self.nFilters):
-			
-	#		#print('        flush f', f,  'nFilters', self.nFilters)
-			
-	#		# Input tensors x, steps
-	#		#print('        Input tensors x, steps')
-	#		#count = torch.zeros((self.nBins,), dtype=torch.int32, device=self.device)
-	#		x     = self.megabatch[f,0:self.curr_size].contiguous()
-	#		steps = self.steps[f].contiguous()
-						
-	#		# Run the CUDA kernel for the module
-	#		#print('        Run the CUDA kernel for the module')
-	#		torch.cuda.synchronize()
-	#		count = hgm__module.histogram_cuda(x, steps)
-	#		#print('        torch.cuda.synchronize()')
-	#		torch.cuda.synchronize()
-		
-	#		#print('         count', count)
-		
-	#		# Update the histogram
-	#		#print('        Update the histogram')
-	#		self.histogram[f] = self.histogram[f] + count
-
-		
-	#	# We are flushed
-	#	self.curr_size = 0
-		
-	#	#print('      END flush')
-	
-
-			# if we do not have enough space,
-			#  then flush the megabatch
-			#if self.curr_size+batch_size > self.megabatch_size:
-			#	self.flush()
-			
-			# append the transposed batch to the megabatch
-			#sidx = self.curr_size
-			#eidx = sidx + batch_size
-			#self.curr_size = eidx
-			
-			#print('megabatch', self.megabatch.shape)
-			#print('sidx', sidx, 'eidx', eidx)
-			#print('x', x.shape)
-			#self.megabatch[:,sidx:eidx] = x.transpose(0,1).contiguous()
-			
-		#print('    END add_batch')
-

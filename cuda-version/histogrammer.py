@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 
 hgm__cuda_source = None
@@ -36,7 +37,7 @@ def Compile():
 		void pit_cuda(torch::Tensor pit, torch::Tensor X, torch::Tensor cdf, torch::Tensor steps);
 		void copula_legendre_cuda(torch::Tensor copula, torch::Tensor obs, torch::Tensor pred);
 		void plot_copula_legendre_cuda(torch::Tensor plot,torch::Tensor copula);
-		int fit_distributions_cuda(torch::Tensor distr, torch::Tensor guess, torch::Tensor Y_mid, torch::Tensor cdf_Y_mid, torch::Tensor log_Yhat, torch::Tensor cdf_Yhat, int type, int metric, float Y0, torch::Tensor X, torch::Tensor cdf_Y, int seed);
+		int fit_distributions_cuda(torch::Tensor distr, torch::Tensor guess, torch::Tensor Y_mid, torch::Tensor cdf_Y_mid, torch::Tensor Yhat_mid, torch::Tensor log_Yhat, torch::Tensor cdf_Yhat, int type, int metric, float Y0, torch::Tensor X, torch::Tensor cdf_Y, int seed);
 	'''
 
 	def get_cuda_arch_flags():
@@ -58,14 +59,26 @@ def Compile():
 	# Get the flags dynamically
 	hgm__cuda_flags = get_cuda_arch_flags()
 
+	# Check the current directory
+	#current_dir = str(Path(__file__).parent.resolve())
+	#print(current_dir)
+
 	# Compiles on the fly!
 	hgm__module = load_inline(
 		name='inline_extension',
 		cpp_sources=[hgm__cpp_source],
 		cuda_sources=[hgm__cuda_source],
-		functions=['histogram_cuda', 'quantiles_cuda', 'quantiles_bounds_cuda', 'cdf_cuda', 'pit_cuda', 'copula_legendre_cuda', 'plot_copula_legendre_cuda'],
+		functions=[
+			'histogram_cuda',
+			'quantiles_cuda',
+			'quantiles_bounds_cuda',
+			'cdf_cuda', 'pit_cuda',
+			'copula_legendre_cuda',
+			'plot_copula_legendre_cuda',
+			'fit_distributions_cuda'],
 		with_cuda=True,
-		extra_cuda_cflags=hgm__cuda_flags
+		extra_cuda_cflags=hgm__cuda_flags #,
+		#extra_ldflags=[current_dir+'/histogrammer.o', '-fPIC']
 	)
 
 
@@ -306,6 +319,7 @@ class QDistr():
 	DISTR_ENTROPY       = 3
 	DISTR_KL_DIVER      = 4
 	DISTR_WAS_DIST      = 5
+	DISTR_N0            = 6
 
 	# Guess structure tensor
 	GUESS_PARAM1        = 0
@@ -313,8 +327,12 @@ class QDistr():
 	GUESS_PARAM1_STEP   = 2
 	GUESS_PARAM2_STEP   = 3
 	
-	def __init__(self, nFilters, nBins, distrib_type, 
-		Y0, metric, seed=(42<<24), device='cuda'):
+	def __init__(self, nFilters, nBins,
+		Y0=0.0, 
+		distrib_type=QDISTR_WEIBULL,
+		metric=QD_METRIC_WASSERSTEIN, 
+		seed=(42<<24), 
+		device='cuda'):
 
 		self.nFilters     = nFilters
 		self.nBins        = nBins
@@ -329,10 +347,11 @@ class QDistr():
 			Compile()
 
 		# Allocate the distribution structure, and guess structure
-		self.distr     = torch.zeros((nFilters,6), dtype=torch.float32, device=device, requires_grad=False)
+		self.distr     = torch.zeros((nFilters,7), dtype=torch.float32, device=device, requires_grad=False)
 		self.guess     = torch.zeros((nFilters,4), dtype=torch.float32, device=device, requires_grad=False)
-		self.Y_mid     = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
+		self.Y         = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
 		self.cdf_Y_mid = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
+		self.Yhat      = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
 		self.log_Yhat  = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
 		self.cdf_Yhat  = torch.zeros((nFilters,nBins), dtype=torch.float32, device=device, requires_grad=False)
 
@@ -345,8 +364,9 @@ class QDistr():
 		self.seed = hgm__module.fit_distributions_cuda(
 			self.distr,         # output:  [C 6]  float32
 			self.guess,         # output:  [C 4]  float32
-			self.Y_mid,         # output:  [C N]  float32
+			self.Y,             # output:  [C N]  float32
 			self.cdf_Y_mid,     # output:  [C N]  float32
+			self.Yhat,          # output:  [C N]  float32
 			self.log_Yhat,      # output:  [C N]  float32
 			self.cdf_Yhat,      # output:  [C N]  float32
 			self.distrib_type, self.metric,
@@ -355,8 +375,44 @@ class QDistr():
 			cdf_Y,         # input:   [C N+1]
 			self.seed);
 		torch.cuda.synchronize()
-		
-		
+	
+#  input:
+#    X [N+1]    Y [N] midpoints
+#  output:
+#    X_np  [2*N]   Y_np [2*N]    series for plotting
+@torch.no_grad()
+def PlotDistrib(X,Y,norm=False,N0=0,N1=9999999999999):
+	
+	# Should we normalize Y ?
+	if norm:
+		Ysum = torch.sum(Y)
+		Y = (1.0 / float(Ysum)) * Y.to(torch.float32)
+	
+	# Crop the series if necessary
+	N = X.shape[0]-1
+	N0 = max(N0, 0)
+	N1 = min(N, N1)
+	X = X[N0:(N1+1)]
+	Y = Y[N0:N1]
+	N = N1-N0
+	
+	# Unpack the midpoint rule for plotting
+	Y = torch.reshape(Y, (N,1)).repeat((1,2))		# Midpoint rule, double every point
+	Y = torch.reshape(Y, (2*N,))
+	X_inter = torch.reshape(X[1:N], (N-1,1)).repeat((1,2))
+	X_inter = torch.reshape(X_inter, (2*(N-1),))
+	X2 = torch.zeros((2*N,), dtype=X.dtype, requires_grad=False, device=X.device)
+	X2[0] = X[0]
+	X2[2*N-1] = X[N]
+	X2[1:(2*N-1)] = X_inter
+	Y_np = Y.detach().cpu().numpy()
+	X_np = X2.detach().cpu().numpy()
+
+	# Return the plot version
+	return X_np,Y_np
+
+
+
 def test():
 
 	print('---------------------------------------------')
@@ -364,10 +420,10 @@ def test():
 	print('---------------------------------------------')
 
 	device='cuda'
-	nFilters = 10
-	nBins = 10
-	batch_size = 1000
-	n_batch = 100
+	nFilters = 1
+	nBins = 2000
+	batch_size = 100000
+	n_batch = 10000
 	#megabatch_size = 32768  #1024
 
 	hg = Histogrammer(device, nFilters, nBins)#, megabatch_size)
@@ -378,8 +434,18 @@ def test():
 	print(' Generate a dataset N(0,1)')
 	print('-----')
 	batches = []
+	rng = np.random.default_rng()
 	with torch.no_grad():
 		for b in range(n_batch):
+			
+			# For tail analysis we need a better 'normal distribution'
+			#data = rng.standard_normal(size=batch_size*nFilters, dtype=np.float64)
+			#data = data.astype(np.float32)
+			#batch = torch.tensor(data, requires_grad=False, dtype=torch.float32, device=device)
+			#batch = torch.reshape(batch, (batch_size, nFilters))
+			#batches.append(batch)
+			
+			# randn is inaccurate for tails . . .
 			batches.append(  torch.randn((batch_size,nFilters), dtype=torch.float32, device=device)  )
 			#batches[b] = F.relu(batches[b])
 			#batches[b].fill_(0.0);
@@ -403,6 +469,15 @@ def test():
 			for b in range(hg.nBins):
 				print('bin (%.3f %.3f)   count %d ' % (hg.steps[0,b], hg.steps[0,b+1], hg.histogram[0,b]))
 
+			# plot the histogram
+			#if hg_epoch >= 1:
+			#	X_np,Y_np = PlotHistogram(hg.steps[0],hg.histogram[0],norm=True)
+			#	print('X_np', X_np.shape)
+			#	print('Y_np', Y_np.shape)
+			#	plt.figure()
+			#	plt.plot(X_np,Y_np)
+			#	plt.show()
+
 			# print the histogram
 			for b in range(hg.nBins+1):
 				print('lo (%.3f %.3f)   hi (%.3f %.3f)   guess  (%.3f %.3f)' % (
@@ -412,6 +487,39 @@ def test():
 			input('quantiles   enter')
 
 	print('Done!')
+	
+	print('---------')
+	print(' Run QDistrib')
+	print('---------')
+	if hg.cdf == None:
+		hg.calc_cdf()
+	
+	qd = QDistr(nFilters, nBins, 
+		Y0 = 0.99,   
+		distrib_type=QDISTR_WEIBULL,
+		metric=QD_METRIC_WASSERSTEIN)
+	
+	qd.fit(hg.steps, hg.cdf)
+	
+	for c in range(qd.nFilters):
+		wei_lamda =     qd.distr[c, qd.DISTR_PARAM1]
+		wei_k     =     qd.distr[c, qd.DISTR_PARAM2]
+		wei_theta =     1.0 / wei_k
+		was_dist  =     qd.distr[c, qd.DISTR_WAS_DIST]
+		kl_diver  =     qd.distr[c, qd.DISTR_KL_DIVER]
+		N0        = int(qd.distr[c, qd.DISTR_N0])
+		print('filter %d  weibull   theta %.6f  lamda %.6f  k %.6f   was %.6f  kl %.6f' %
+				(c,  wei_theta, wei_lamda, wei_k, was_dist, kl_diver))
+
+		X_np,Y_np    = PlotDistrib(hg.steps[c],qd.Y[c],N0=N0)
+		X_np,Yhat_np = PlotDistrib(hg.steps[c],qd.Yhat[c],N0=N0)
+		plt.figure()
+		plt.plot(X_np,Y_np)
+		plt.plot(X_np,Yhat_np)
+		plt.show()
+
+	input('enter')
+		
 
 	print('---------')
 	print(' Run Copula')
@@ -447,8 +555,7 @@ def test():
 		for f in range(nFilters):
 			plt.figure(figsize=(10, 6))
 			hg.plt_plot_copula(copula_plot_np, f)
-			plt.show()
-		
+			plt.show()	
 
 if __name__ == "__main__":
 	test()

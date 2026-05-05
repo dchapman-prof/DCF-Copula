@@ -1320,7 +1320,7 @@ void BoundsDistribution(float *guess, int type)
 //    Yhat  length nBins     (at midpoints)
 //
 __device__
-void PlotDistribution(int type, float param1, float param2, const float *X, float *Y, int startBin, int nBins) {
+void PlotDistribution(int type, float param1, float param2, const float *X, float *Y, int startBin, int nBins, int midpoint_rule) {
 	int i;
 
 	// premature optimization
@@ -1347,11 +1347,13 @@ void PlotDistribution(int type, float param1, float param2, const float *X, floa
 	float gpd_over_s = 1.0 / gpd_s;
 	float gpd_over_xi = 1.0 / gpd_xi;
 
+	int endBin = (midpoint_rule) ? nBins : nBins+1;
+
 	// Plot the PDF
-	for (i=startBin; i<nBins; i++)
+	for (i=startBin; i<endBin; i++)
 	{
 		// Pick x as the midpoint for midpoint rule
-		float x = 0.5*(X[i]+X[i+1]);
+		float x = (midpoint_rule) ? 0.5*(X[i]+X[i+1]) : X[i];
 		
 		switch(type)
 		{
@@ -1407,7 +1409,7 @@ void PlotDistribution(int type, float param1, float param2, const float *X, floa
 //    Yhat  length nBins     (at midpoints)
 //
 __device__
-void PlotCdfDistribution(int type, float param1, float param2, const float *X, float *Y, int startBin, int nBins) 
+void PlotCdfDistribution(int type, float param1, float param2, const float *X, float *Y, int startBin, int nBins, int midpoint_rule) 
 {
 	int i;
 
@@ -1435,11 +1437,13 @@ void PlotCdfDistribution(int type, float param1, float param2, const float *X, f
 	float gpd_over_s = 1.0 / gpd_s;
 	float gpd_over_xi = 1.0 / gpd_xi;
 
+	int endBin = (midpoint_rule) ? nBins : nBins+1;
+
 	// Plot the PDF
-	for (i=startBin; i<nBins; i++)
+	for (i=startBin; i<endBin; i++)
 	{
 		// Pick x as the midpoint for midpoint rule
-		float x = 0.5*(X[i]+X[i+1]);
+		float x = (midpoint_rule) ? 0.5*(X[i]+X[i+1]) : X[i];
 		
 		switch(type)
 		{
@@ -1508,7 +1512,7 @@ void PlotCdfDistribution(int type, float param1, float param2, const float *X, f
 //    Yhat  length nBins     (at midpoints)
 //
 __device__
-void PlotLogDistribution(int type, float param1, float param2, const float *X, float *Y, int startBin, int nBins) {
+void PlotLogDistribution(int type, float param1, float param2, const float *X, float *Y, int startBin, int nBins, int midpoint_rule) {
 	int i;
 
 	// premature optimization
@@ -1536,11 +1540,13 @@ void PlotLogDistribution(int type, float param1, float param2, const float *X, f
 	float gpd_over_s = 1.0 / gpd_s;
 	float gpd_over_xi = 1.0 / gpd_xi;
 
+	int endBin = (midpoint_rule) ? nBins : nBins+1;
+
 	// Plot the PDF
-	for (i=startBin; i<nBins; i++)
+	for (i=startBin; i<endBin; i++)
 	{
 		// Pick x as the midpoint for midpoint rule
-		float x = 0.5*(X[i]+X[i+1]);
+		float x = (midpoint_rule) ? 0.5*(X[i]+X[i+1]) : X[i];
 		
 		switch(type)
 		{
@@ -1841,12 +1847,13 @@ __device__ float random_f_bal(uint32_t seed)
 //  input:
 //     metric         QD_METRIC_KL,  or  QD_METRIC_WASSERSTEIN
 //-----------------
-#define _PARAM1 0
-#define _PARAM2 1
+#define _PARAM1        0
+#define _PARAM2        1
 #define _CROSS_ENTROPY 2
-#define _ENTROPY 3
-#define _KL_DIVER 4
-#define _WAS_DIST 5
+#define _ENTROPY       3
+#define _KL_DIVER      4
+#define _WAS_DIST      5
+#define _N0            6
 
 #define _PARAM1_STEP 2
 #define _PARAM2_STEP 3
@@ -1874,6 +1881,7 @@ void FitDistribution(          //       [0]     [1]       [2]          [3]      
 	distr[_ENTROPY]       = -9999.0;
 	distr[_KL_DIVER]      = -9999.0;
 	distr[_WAS_DIST]      = -9999.0;
+	distr[_N0]            = (float)N0;
 
 	// Initial guess . . .
 	InitialGuessDistribution(guess, type, X, Y, N);
@@ -1888,25 +1896,37 @@ void FitDistribution(          //       [0]     [1]       [2]          [3]      
 		//	iN0 = N/4;
 			
 		// Second bin for initial guess fit
-		int iN1 = iN0 + 9*(N-iN0) / 10;
-		if (iN1 >= N)
-			iN1 = N-1;
-		float x0 = 0.5*(X[iN0]+X[iN0+1]);    // first x midpoint rule
-		float x1 = 0.5*(X[iN1]+X[iN1+1]);    // second x midpoint rule
-		float F0 = cdf_Y[iN0];
-		float F1 = cdf_Y[iN1];
+		float x0,x1,F0,F1;
+		int iN1 = N-1;
+		for (int tries=0; tries<100; tries++) {
+			iN1 = iN0 + 9*(iN1-iN0) / 10;
+			x0  = 0.5*(X[iN0]+X[iN0+1]);    // first x midpoint rule
+			x1  = 0.5*(X[iN1]+X[iN1+1]);    // second x midpoint rule
+			F0  = cdf_Y[iN0];
+			F1  = cdf_Y[iN1];
+			if (F1 < 0.99999)
+				break;
+		}
+		
+		
 		//printf(" HACK x0 %f  x1 %f  F0 %f  F1 %f   N0 %d iN0 %d N %d iN1 %dn", x0, x1, F0, F1, N0, iN0, N, iN1);
 		//input();
 		
 		// Strong initial guess using the two points
 		float wei_k   = log( log(1-F0)/log(1-F1) ) / log( x0/x1 );
 		float wei_lam = x0 / pow( -log(1-F0), 1.0/wei_k );
+		//printf(" HACK wei_k  %.6f   wei_lam %.6f\n", wei_k, wei_lam);
 
 		// Store in the guess
 		guess[_PARAM1] = wei_lam;
 		guess[_PARAM2] = wei_k;
 		guess[_PARAM1_STEP] = wei_lam;
 		guess[_PARAM2_STEP] = wei_k;
+
+// HACK HACK, force lamda=2 (gaussian like tail)
+//guess[_PARAM1] = 2.0;
+//guess[_PARAM1_STEP] = 0.0;
+
 	}
 
 
@@ -1917,8 +1937,8 @@ void FitDistribution(          //       [0]     [1]       [2]          [3]      
 	distr[_PARAM1] = guess[_PARAM1];
 	distr[_PARAM2] = guess[_PARAM2];
 	//PlotDistribution(type, param1, param2, X, log_Yhat, N0, N);
-	PlotLogDistribution(type, distr[_PARAM1], distr[_PARAM2], X, log_Yhat, N0, N);
-	PlotCdfDistribution(type, distr[_PARAM1], distr[_PARAM2], X, cdf_Yhat, N0, N);
+	PlotLogDistribution(type, distr[_PARAM1], distr[_PARAM2], X, log_Yhat, N0, N, true);
+	PlotCdfDistribution(type, distr[_PARAM1], distr[_PARAM2], X, cdf_Yhat, N0, N, true);
 	//float cross_entropy = CrossEntropy(X, Y, log_Yhat, N0, N);
 	distr[_CROSS_ENTROPY] = LogCrossEntropy(X, Y, log_Yhat, N0, N);
 	distr[_WAS_DIST]      = WassersteinDistance(X, cdf_Y, cdf_Yhat, N0, N);
@@ -1954,19 +1974,24 @@ void FitDistribution(          //       [0]     [1]       [2]          [3]      
 
 
 	for (iter=0; iter<500; iter++) {
+	//for (iter=0; iter<0; iter++) {
 		int myseed = seed + 2*iter;
 		guess[_PARAM1] = distr[_PARAM1] + random_f_bal(myseed)   * guess[_PARAM1_STEP];
 		guess[_PARAM2] = distr[_PARAM2] + random_f_bal(myseed+1) * guess[_PARAM2_STEP];
 
 		BoundsDistribution(guess, type);
+		//printf("iter %d lam %.6f k %.6f  lam step %.6f  k step %.6f\n",
+		//	iter, guess[_PARAM1], guess[_PARAM2], guess[_PARAM1_STEP], guess[_PARAM2_STEP]);
 
 		//PlotDistribution(type, new_param1, new_param2, X, log_Yhat, N);
-		PlotLogDistribution(type, guess[_PARAM1], guess[_PARAM2], X, log_Yhat, N0, N);
-		PlotCdfDistribution(type, guess[_PARAM1], guess[_PARAM2], X, cdf_Yhat, N0, N);
+		PlotLogDistribution(type, guess[_PARAM1], guess[_PARAM2], X, log_Yhat, N0, N, true);
+		PlotCdfDistribution(type, guess[_PARAM1], guess[_PARAM2], X, cdf_Yhat, N0, N, true);
 		float new_cross_entropy = LogCrossEntropy(X, Y, log_Yhat, N0, N);
 		float new_was_dist      = WassersteinDistance(X, cdf_Y, cdf_Yhat, N0, N);
 		float new_loss = (metric==QD_METRIC_KL) ? new_cross_entropy : new_was_dist;
+		//printf("  loss %.6f   new_loss %.6f\n", loss, new_loss);
 		if (new_loss < loss && !isnan(new_loss) && !isinf(new_loss)) {
+			//printf("  GOOD GUESS!!!\n");
 			distr[_PARAM1] = guess[_PARAM1];
 			distr[_PARAM2] = guess[_PARAM2];
 			distr[_CROSS_ENTROPY] = new_cross_entropy;
@@ -2034,8 +2059,10 @@ void FitDistribution(          //       [0]     [1]       [2]          [3]      
 //  output:                        [0]     [1]         [2]         [3]       [4]      [5]
 //     distr     [C 6]           {param1, param2, cross_entropy, entropy, kl_diver, was_dist}
 //     guess     [C 4]           {param1, param2, param1_step, param2_step}
+//     Yhat      [C N+1]
 //     Y_mid     [C N]
 //     cdf_Y_mid [C N]
+//     Yhat_mid  [C N]               Yhat values of distribution using the midpoint rule
 //     log_Yhat  [C N]
 //     cdf_Yhat  [C N]
 //
@@ -2053,6 +2080,7 @@ void fit_distributions_kernel(
 	float* __restrict__ guess_data,         // output:  [C 4]  float32
 	float* __restrict__ Y_mid_data,         // output:  [C N]  float32
 	float* __restrict__ cdf_Y_mid_data,     // output:  [C N]  float32
+	float* __restrict__ Yhat_mid_data,      // output:  [C N]  float32
 	float* __restrict__ log_Yhat_data,      // output:  [C N]  float32
 	float* __restrict__ cdf_Yhat_data,      // output:  [C N]  float32
 	int type, int metric,
@@ -2065,19 +2093,32 @@ void fit_distributions_kernel(
 	int c = blockIdx.x * blockDim.x + threadIdx.x;
 	
 	// If we're off the map, return
-	if (c>C)
+	if (c>=C)
 		return;
 	
+	//printf("c %d   C %d N %d base_seed %d\n", c, C, N, base_seed);
+	
 	// Pointer into the data  (shard on channel)
-	float* distr       = distr_data     +  c * 6;
+	float* distr       = distr_data     +  c * 7;
 	float* guess       = guess_data     +  c * 4;
 	float* Y_mid       = Y_mid_data     +  c * N;
 	float* cdf_Y_mid   = cdf_Y_mid_data +  c * N;
+	float* Yhat_mid    = Yhat_mid_data  +  c * N;
 	float* log_Yhat    = log_Yhat_data  +  c * N;
 	float* cdf_Yhat    = cdf_Yhat_data  +  c * N;
 	const float* X     = X_data         +  c * (N+1);
 	const float* cdf_Y = cdf_Y_data     +  c * (N+1);
 	int seed = base_seed + c*2*500;
+
+	//printf("c %d   distr     %p\n", c, distr);
+	//printf("c %d   guess     %p\n", c, guess);
+	//printf("c %d   Y_mid     %p\n", c, Y_mid);
+	//printf("c %d   cdf_Y_mid %p\n", c, cdf_Y_mid);
+	//printf("c %d   log_Yhat  %p\n", c, log_Yhat);
+	//printf("c %d   cdf_Yhat  %p\n", c, cdf_Yhat);
+	//printf("c %d   X         %p\n", c, X);
+	//printf("c %d   cdf_Y     %p\n", c, cdf_Y);
+
 	
 	//----
 	// Calculate the Y_mid and cdf_Y_mid (midpoint rule)
@@ -2103,6 +2144,8 @@ void fit_distributions_kernel(
 			N0 = n;
 	}
 	
+	//printf("c %d   N0 %d  Y0 %f\n", c, N0, Y0);
+	
 	//----
 	// Fit the distribution using simulated annealing
 	//----
@@ -2116,6 +2159,11 @@ void fit_distributions_kernel(
 		log_Yhat,
 		cdf_Yhat,
 		N0, N, seed);
+
+	//----
+	// Plot Yhat mid
+	//----
+	PlotDistribution(type, distr[_PARAM1], distr[_PARAM2], X, Yhat_mid, 0, N, true);
 }
 
 
@@ -2126,11 +2174,12 @@ void fit_distributions_kernel(
 //  Define the following shape variables
 //      N nBins    C nChannels
 //
-//  output:                        [0]      [1]       [2]          [3]       [4]       [5]
-//     distr     [C 6]           {param1, param2, cross_entropy, entropy, kl_diver, was_dist}
+//  output:                        [0]      [1]       [2]          [3]       [4]       [5]    [6]
+//     distr     [C 7]           {param1, param2, cross_entropy, entropy, kl_diver, was_dist, N0}
 //     guess     [C 4]           {param1, param2, param1_step, param2_step}
 //     Y_mid     [C N]               Y values of distribution using the midpoint rule
 //     cdf_Y_mid [C N]           cdf_Y values of distribution using the midpoint rule
+//     Yhat_mid  [C N]               Yhat values of distribution using the midpoint rule
 //     log_Yhat  [C N]
 //     cdf_Yhat  [C N]
 //
@@ -2141,6 +2190,7 @@ void fit_distributions_kernel(
 //     X         [C N+1]          X,Y values of distribution in histogrammer format
 //     cdf_Y     [C N+1]
 //
+//
 //  return:
 //     seed (updated)
 //
@@ -2150,6 +2200,7 @@ int fit_distributions_cuda(
 	torch::Tensor guess,         // output:  [C 4]  float32
 	torch::Tensor Y_mid,         // output:  [C N]  float32
 	torch::Tensor cdf_Y_mid,     // output:  [C N]  float32
+	torch::Tensor Yhat_mid,      // output:  [C N]  float32
 	torch::Tensor log_Yhat,      // output:  [C N]  float32
 	torch::Tensor cdf_Yhat,      // output:  [C N]  float32
 	int type, int metric,
@@ -2162,33 +2213,38 @@ int fit_distributions_cuda(
 	
 	// Check Shapes . . .
 	int dC   = distr.sizes()[0];
-	int d6   = distr.sizes()[1];
+	int d7   = distr.sizes()[1];
 	int gC   = guess.sizes()[0];
 	int g4   = guess.sizes()[1];
 	int ymC  = Y_mid.sizes()[0];
 	int ymN  = Y_mid.sizes()[1];
 	int cymC = cdf_Y_mid.sizes()[0];
 	int cymN = cdf_Y_mid.sizes()[1];
+	int yhmC = Yhat_mid.sizes()[0];
+	int yhmN = Yhat_mid.sizes()[1];
 	int lyhC = log_Yhat.sizes()[0];
 	int lyhN = log_Yhat.sizes()[1];
+	int cyhC = cdf_Yhat.sizes()[0];
+	int cyhN = cdf_Yhat.sizes()[1];
 	int xC   = X.sizes()[0];
 	int xN   = X.sizes()[1]-1;
 	int cyC  = cdf_Y.sizes()[0];
 	int cyN  = cdf_Y.sizes()[1]-1;
 	
-	if (dC!=gC || dC!=ymC || dC!=cymC || dC!=lyhC || dC!=xC || dC!=cyC) {
+	
+	if (dC!=gC || dC!=ymC || dC!=cymC || dC!=yhmC || dC!=lyhC || dC!=cyhC || dC!=xC || dC!=cyC) {
 		printf("ERROR: fit_distributions_cuda channels mismatch\n");
 		exit(1);
 	}
-	if (d6!=6) {
-		printf("ERROR: fit_distributions_cuda distribution must have 5 parts\n");
+	if (d7!=7) {
+		printf("ERROR: fit_distributions_cuda distribution must have 7 parts\n");
 		exit(1);
 	}
 	if (g4!=4) {
 		printf("ERROR: fit_distributions_cuda guess must have 4 parts\n");
 		exit(1);
 	}
-	if (ymN!=cymN || ymN!=lyhN || ymN!=xN || ymN!=cyN) {
+	if (ymN!=cymN || ymN!=yhmN || ymN!=lyhN || ymN!=cyhN || ymN!=xN || ymN!=cyN) {
 		printf("ERROR: fit_distributions_cuda num elements mismatch\n");
 		exit(1);
 	}
@@ -2198,10 +2254,22 @@ int fit_distributions_cuda(
 	float* guess_data     = guess.data_ptr<float>();
 	float* Y_mid_data     = Y_mid.data_ptr<float>();
 	float* cdf_Y_mid_data = cdf_Y_mid.data_ptr<float>();
+	float* Yhat_mid_data  = Yhat_mid.data_ptr<float>();
 	float* log_Yhat_data  = log_Yhat.data_ptr<float>();
 	float* cdf_Yhat_data  = cdf_Yhat.data_ptr<float>();
 	float* X_data         = X.data_ptr<float>();
 	float* cdf_Y_data     = cdf_Y.data_ptr<float>();
+
+
+	printf("distr     %p (%d %d)\n",  distr_data,       dC,   d7);
+	printf("guess     %p (%d %d)\n",  guess_data,       gC,   g4);
+	printf("Y_mid     %p (%d %d)\n",  Y_mid_data,       ymC,  ymN);
+	printf("cdf_Y_mid %p (%d %d)\n",  cdf_Y_mid_data,   cymC, cymN);
+	printf("Yhat_mid  %p (%d %d)\n",  Yhat_mid_data,    yhmC,  yhmN);
+	printf("log_Yhat  %p (%d %d)\n",  log_Yhat_data,    lyhC, lyhN);
+	printf("cdf_Yhat  %p (%d %d)\n",  cdf_Yhat_data,    cyhC, cyhN);
+	printf("X         %p (%d %d)\n",  X_data,           xC,   xN+1);
+	printf("cdf_Y     %p (%d %d)\n",  cdf_Y_data,       cyC,  cyN+1);
 	
 	// How many blocks
 	dim3 thPerBlk(256,1,1);
@@ -2213,6 +2281,7 @@ int fit_distributions_cuda(
 		guess_data,         // output:  [C 4]  float32
 		Y_mid_data,         // output:  [C N]  float32
 		cdf_Y_mid_data,     // output:  [C N]  float32
+		Yhat_mid_data,      // output:  [C N]  float32
 		log_Yhat_data,      // output:  [C N]  float32
 		cdf_Yhat_data,      // output:  [C N]  float32
 		type, metric,

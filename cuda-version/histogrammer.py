@@ -23,7 +23,11 @@ def Compile():
 	global hgm__cuda_flags
 	global hgm__module
 
-	with open('histogrammer.cu', 'r') as fin:
+	# Check the current directory
+	current_dir = str(Path(__file__).parent.resolve())
+	print(current_dir)
+
+	with open(current_dir+'/histogrammer.cu', 'r') as fin:
 		hgm__cuda_source = fin.read()
 
 	print(hgm__cuda_source)
@@ -58,10 +62,6 @@ def Compile():
 
 	# Get the flags dynamically
 	hgm__cuda_flags = get_cuda_arch_flags()
-
-	# Check the current directory
-	#current_dir = str(Path(__file__).parent.resolve())
-	#print(current_dir)
 
 	# Compiles on the fly!
 	hgm__module = load_inline(
